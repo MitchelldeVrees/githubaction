@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -953,16 +954,19 @@ def build_telegram_message(signals: list[dict[str, Any]]) -> str:
     return build_telegram_messages(signals)[0]
 
 
-def send_telegram_message(message: str) -> bool:
+def send_telegram_message(message: str, fail_on_error: bool = False) -> bool:
     """Send a Telegram message when credentials are available."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-        print(
+        warning = (
             "Warning: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing; "
             "skipping Telegram notification."
         )
+        print(warning)
+        if fail_on_error:
+            raise RuntimeError(warning)
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -972,13 +976,44 @@ def send_telegram_message(message: str) -> bool:
             json={"chat_id": chat_id, "text": message},
             timeout=20,
         )
-        response.raise_for_status()
+        if not response.ok:
+            warning = (
+                "Telegram API request failed with "
+                f"HTTP {response.status_code}: {response.text[:500]}"
+            )
+            print(f"Warning: {warning}")
+            if fail_on_error:
+                raise RuntimeError(warning)
+            return False
     except requests.RequestException as exc:
-        print(f"Warning: Telegram API request failed: {exc}")
+        error_text = str(exc)
+        if token:
+            error_text = error_text.replace(token, "<redacted>")
+        warning = f"Telegram API request failed: {type(exc).__name__}: {error_text}"
+        print(f"Warning: {warning}")
+        if fail_on_error:
+            raise RuntimeError(warning) from exc
         return False
 
     print("Telegram notification sent.")
     return True
+
+
+def run_telegram_test() -> None:
+    """Send a Telegram test message and fail with diagnostics on error."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    print(f"TELEGRAM_BOT_TOKEN configured: {'yes' if token else 'no'}")
+    print(f"TELEGRAM_CHAT_ID configured: {'yes' if chat_id else 'no'}")
+
+    try:
+        send_telegram_message("DominantAM Telegram test message", fail_on_error=True)
+    except RuntimeError as exc:
+        print(f"Telegram test failed: {exc}")
+        raise SystemExit(1) from exc
+
+    print("Telegram test succeeded.")
 
 
 def maybe_send_telegram(results: list[dict[str, Any]]) -> None:
@@ -1027,4 +1062,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--telegram-test" in sys.argv:
+        run_telegram_test()
+    else:
+        main()

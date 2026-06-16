@@ -158,6 +158,14 @@ DominantAM has been run but nothing was found
 
 Set `SEND_NO_SIGNAL_MESSAGE=false` if you want to turn that no-signal message off.
 
+To test Telegram only, go to `Actions -> Dominant MA/EMA Scanner -> Run workflow`, turn on `telegram_test`, and run it. This sends:
+
+```text
+DominantAM Telegram test message
+```
+
+If the token or chat ID is wrong, that test run fails and prints the Telegram API error in the workflow logs.
+
 ## Create Telegram Bot
 
 1. Open Telegram.
@@ -218,8 +226,9 @@ GitHub cron uses UTC and does not understand Amsterdam daylight saving time. The
 3. Go to `Actions`.
 4. Select `Dominant MA/EMA Scanner`.
 5. Click `Run workflow`.
-6. Leave `commit_results` off for a test run, or turn it on if you want the workflow to commit updated result files.
-7. Open the completed run and download the `dominant-ma-alert-results` artifact.
+6. Leave `commit_results` off for a scanner test run, or turn it on if you want the workflow to commit updated result files.
+7. To test only Telegram, turn on `telegram_test`; this skips the full scanner and sends a test message.
+8. Open the completed run and download the `dominant-ma-alert-results` artifact.
 
 ## Output Fields
 
