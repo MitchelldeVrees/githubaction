@@ -44,6 +44,20 @@ jobs:
         if: steps.schedule_gate.outputs.should_run == 'true'
         uses: actions/checkout@v4
 
+      - name: Restore Yahoo price cache
+        if: steps.schedule_gate.outputs.should_run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/yfinance
+          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-
+            yfinance-price-cache-${{ runner.os }}-
+
+      - name: Ensure price cache directory
+        if: steps.schedule_gate.outputs.should_run == 'true'
+        run: mkdir -p .cache/yfinance
+
       - name: Set up Python
         if: steps.schedule_gate.outputs.should_run == 'true'
         uses: actions/setup-python@v5
@@ -68,7 +82,24 @@ jobs:
           BOUNCE_WEIGHT: ${{ vars.BOUNCE_WEIGHT }}
           YFINANCE_PERIOD: ${{ vars.YFINANCE_PERIOD }}
           YFINANCE_AUTO_ADJUST: ${{ vars.YFINANCE_AUTO_ADJUST }}
+          YFINANCE_INCREMENTAL_PERIOD: ${{ vars.YFINANCE_INCREMENTAL_PERIOD }}
+          YFINANCE_BATCH_SIZE: ${{ vars.YFINANCE_BATCH_SIZE }}
+          YFINANCE_MAX_RETRIES: ${{ vars.YFINANCE_MAX_RETRIES }}
+          YFINANCE_RETRY_SLEEP_SECONDS: ${{ vars.YFINANCE_RETRY_SLEEP_SECONDS }}
+          YFINANCE_BATCH_DELAY_SECONDS: ${{ vars.YFINANCE_BATCH_DELAY_SECONDS }}
+          YFINANCE_THREADS: ${{ vars.YFINANCE_THREADS }}
+          ENABLE_PRICE_CACHE: ${{ vars.ENABLE_PRICE_CACHE }}
+          DATA_CACHE_DIR: ${{ vars.DATA_CACHE_DIR }}
+          CACHE_STALE_DAYS: ${{ vars.CACHE_STALE_DAYS }}
+          TELEGRAM_MAX_MESSAGE_CHARS: ${{ vars.TELEGRAM_MAX_MESSAGE_CHARS }}
         run: python scanner.py
+
+      - name: Save Yahoo price cache
+        if: ${{ always() && steps.schedule_gate.outputs.should_run == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/yfinance
+          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ github.run_id }}
 
       - name: Upload scanner results
         if: steps.schedule_gate.outputs.should_run == 'true'

@@ -10,8 +10,10 @@ alerts.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -72,6 +74,18 @@ RESULTS_DIR = env_path("RESULTS_DIR", "results")
 # yfinance with auto_adjust=True returns split/dividend adjusted OHLC values.
 YFINANCE_PERIOD = env_str("YFINANCE_PERIOD", "max")
 YFINANCE_AUTO_ADJUST = env_bool("YFINANCE_AUTO_ADJUST", True)
+YFINANCE_INCREMENTAL_PERIOD = env_str("YFINANCE_INCREMENTAL_PERIOD", "3mo")
+YFINANCE_BATCH_SIZE = env_int("YFINANCE_BATCH_SIZE", 50)
+YFINANCE_MAX_RETRIES = env_int("YFINANCE_MAX_RETRIES", 3)
+YFINANCE_RETRY_SLEEP_SECONDS = env_float("YFINANCE_RETRY_SLEEP_SECONDS", 10.0)
+YFINANCE_BATCH_DELAY_SECONDS = env_float("YFINANCE_BATCH_DELAY_SECONDS", 2.0)
+YFINANCE_THREADS = env_bool("YFINANCE_THREADS", False)
+
+ENABLE_PRICE_CACHE = env_bool("ENABLE_PRICE_CACHE", True)
+DATA_CACHE_DIR = env_path("DATA_CACHE_DIR", ".cache/yfinance")
+CACHE_STALE_DAYS = env_int("CACHE_STALE_DAYS", 45)
+
+TELEGRAM_MAX_MESSAGE_CHARS = env_int("TELEGRAM_MAX_MESSAGE_CHARS", 3900)
 
 
 TIMEFRAME_RULES: dict[str, str] = {
@@ -162,45 +176,314 @@ def load_tickers(path: Path = TICKERS_FILE) -> list[str]:
     return tickers
 
 
-def normalize_yfinance_columns(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """Return a single-ticker OHLCV DataFrame from yfinance output."""
+def chunked(items: list[str], size: int) -> list[list[str]]:
+    """Split a list into fixed-size chunks."""
+    chunk_size = max(1, size)
+    return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def clean_price_frame(data: pd.DataFrame) -> pd.DataFrame:
+    """Normalize OHLCV columns, index, ordering, and numeric values."""
     if data.empty:
         return data
-
-    if isinstance(data.columns, pd.MultiIndex):
-        if ticker in data.columns.get_level_values(-1):
-            data = data.xs(ticker, axis=1, level=-1)
-        else:
-            data = data.copy()
-            data.columns = data.columns.get_level_values(0)
 
     data = data.rename(columns={column: str(column).title() for column in data.columns})
     missing = [column for column in OHLC_COLUMNS if column not in data.columns]
     if missing:
         raise ValueError(f"Missing OHLC columns: {', '.join(missing)}")
 
-    data = data[OHLC_COLUMNS].dropna(subset=["Open", "High", "Low", "Close"])
+    data = data[OHLC_COLUMNS].copy()
+    for column in OHLC_COLUMNS:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    data = data.dropna(subset=["Open", "High", "Low", "Close"])
     data = data.sort_index()
     data.index = pd.to_datetime(data.index)
     if data.index.tz is not None:
         data.index = data.index.tz_convert(None)
+    data.index.name = "Date"
     return data
+
+
+def normalize_yfinance_columns(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Return a single-ticker OHLCV DataFrame from yfinance output."""
+    if data.empty:
+        return data
+
+    if isinstance(data.columns, pd.MultiIndex):
+        for level in range(data.columns.nlevels):
+            if ticker in data.columns.get_level_values(level):
+                data = data.xs(ticker, axis=1, level=level)
+                break
+
+    while isinstance(data.columns, pd.MultiIndex) and data.columns.nlevels > 1:
+        dropped_level = False
+        for level in range(data.columns.nlevels):
+            if len(set(data.columns.get_level_values(level))) == 1:
+                data = data.copy()
+                data.columns = data.columns.droplevel(level)
+                dropped_level = True
+                break
+        if not dropped_level:
+            data = data.copy()
+            data.columns = data.columns.get_level_values(-1)
+            break
+
+    return clean_price_frame(data)
+
+
+def cache_mode_dir() -> Path:
+    """Return the cache directory for the current OHLC adjustment mode."""
+    mode = "adjusted" if YFINANCE_AUTO_ADJUST else "raw"
+    return DATA_CACHE_DIR / mode
+
+
+def cache_file_for_ticker(ticker: str) -> Path:
+    """Return a deterministic cache path for a Yahoo ticker."""
+    safe_name = "".join(
+        character if character.isalnum() else "_"
+        for character in ticker.upper()
+    ).strip("_")
+    safe_name = safe_name or "ticker"
+    digest = hashlib.sha1(ticker.upper().encode("utf-8")).hexdigest()[:10]
+    return cache_mode_dir() / f"{safe_name}_{digest}.csv"
+
+
+def read_cached_price_data(ticker: str) -> pd.DataFrame | None:
+    """Read cached daily OHLCV data for one ticker."""
+    if not ENABLE_PRICE_CACHE:
+        return None
+
+    cache_path = cache_file_for_ticker(ticker)
+    if not cache_path.exists():
+        return None
+
+    try:
+        data = pd.read_csv(cache_path, index_col="Date", parse_dates=True)
+        data = clean_price_frame(data)
+    except Exception as exc:  # noqa: BLE001 - corrupt cache should not stop a run.
+        print(f"Warning: ignoring unreadable cache for {ticker}: {exc}")
+        return None
+
+    return data if not data.empty else None
+
+
+def write_cached_price_data(ticker: str, data: pd.DataFrame) -> None:
+    """Write daily OHLCV data to the local ticker cache."""
+    if not ENABLE_PRICE_CACHE or data.empty:
+        return
+
+    cache_path = cache_file_for_ticker(ticker)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cached = clean_price_frame(data)
+    cached.to_csv(cache_path, index_label="Date")
+
+
+def latest_data_age_days(data: pd.DataFrame) -> int | None:
+    """Return the age in days of the latest cached candle."""
+    if data.empty:
+        return None
+
+    latest_date = pd.to_datetime(data.index.max()).tz_localize(None).normalize()
+    today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    return int((today - latest_date).days)
+
+
+def cache_needs_full_refresh(data: pd.DataFrame | None) -> bool:
+    """Decide whether cached data is too old for an incremental update."""
+    if data is None or data.empty:
+        return True
+
+    age_days = latest_data_age_days(data)
+    return age_days is None or age_days > CACHE_STALE_DAYS
+
+
+def merge_price_data(
+    cached: pd.DataFrame | None,
+    fresh: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge cached and fresh OHLCV data, preferring fresh duplicate rows."""
+    if cached is None or cached.empty:
+        return clean_price_frame(fresh)
+
+    combined = pd.concat([cached, fresh])
+    combined = combined[~combined.index.duplicated(keep="last")]
+    combined = combined.sort_index()
+    return clean_price_frame(combined)
+
+
+def extract_ticker_from_download(
+    downloaded: pd.DataFrame,
+    ticker: str,
+) -> pd.DataFrame:
+    """Extract one ticker's OHLCV frame from a yfinance batch response."""
+    if downloaded.empty:
+        return downloaded
+    return normalize_yfinance_columns(downloaded.copy(), ticker)
+
+
+def download_yfinance_once(tickers: list[str], period: str) -> pd.DataFrame:
+    """Call yfinance once for a ticker batch."""
+    data = yf.download(
+        tickers=tickers,
+        period=period,
+        interval="1d",
+        auto_adjust=YFINANCE_AUTO_ADJUST,
+        progress=False,
+        group_by="ticker",
+        threads=YFINANCE_THREADS,
+    )
+    return data
+
+
+def sleep_before_retry(attempt: int) -> None:
+    """Sleep with exponential backoff between Yahoo retries."""
+    sleep_seconds = YFINANCE_RETRY_SLEEP_SECONDS * (2 ** (attempt - 1))
+    if sleep_seconds <= 0:
+        return
+    print(f"Waiting {sleep_seconds:g}s before retry...")
+    time.sleep(sleep_seconds)
+
+
+def download_price_batches(
+    tickers: list[str],
+    period: str,
+    batch_label: str,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Download ticker data in batches with retries and request spacing."""
+    data_by_ticker: dict[str, pd.DataFrame] = {}
+    errors_by_ticker: dict[str, str] = {}
+    if not tickers:
+        return data_by_ticker, errors_by_ticker
+
+    batches = chunked(tickers, YFINANCE_BATCH_SIZE)
+    max_retries = max(1, YFINANCE_MAX_RETRIES)
+
+    for batch_index, batch in enumerate(batches, start=1):
+        remaining = list(batch)
+        last_error = "Yahoo Finance returned no OHLC data"
+        print(
+            f"Downloading {batch_label} batch {batch_index}/{len(batches)} "
+            f"({len(batch)} tickers, period={period})..."
+        )
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                downloaded = download_yfinance_once(remaining, period)
+                recovered: list[str] = []
+
+                for ticker in remaining:
+                    try:
+                        ticker_data = extract_ticker_from_download(downloaded, ticker)
+                    except Exception as exc:  # noqa: BLE001 - retry ticker below.
+                        errors_by_ticker[ticker] = str(exc)
+                        continue
+
+                    if ticker_data.empty:
+                        errors_by_ticker[ticker] = "Yahoo Finance returned no OHLC data"
+                        continue
+
+                    data_by_ticker[ticker] = ticker_data
+                    recovered.append(ticker)
+                    errors_by_ticker.pop(ticker, None)
+
+                remaining = [ticker for ticker in remaining if ticker not in recovered]
+                if not remaining:
+                    break
+
+                last_error = (
+                    f"Yahoo Finance returned no OHLC data for "
+                    f"{len(remaining)} ticker(s)"
+                )
+
+            except Exception as exc:  # noqa: BLE001 - retry batch below.
+                last_error = str(exc)
+
+            if remaining and attempt < max_retries:
+                print(
+                    f"Retry {attempt}/{max_retries - 1} for "
+                    f"{len(remaining)} ticker(s). Last error: {last_error}"
+                )
+                sleep_before_retry(attempt)
+
+        for ticker in remaining:
+            errors_by_ticker[ticker] = errors_by_ticker.get(ticker, last_error)
+
+        if batch_index < len(batches) and YFINANCE_BATCH_DELAY_SECONDS > 0:
+            time.sleep(YFINANCE_BATCH_DELAY_SECONDS)
+
+    return data_by_ticker, errors_by_ticker
+
+
+def download_price_data_bulk(
+    tickers: list[str],
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Download and cache daily OHLCV data for all tickers."""
+    unique_tickers = list(dict.fromkeys(tickers))
+    cached_by_ticker: dict[str, pd.DataFrame] = {}
+    full_history_tickers: list[str] = []
+    incremental_tickers: list[str] = []
+
+    for ticker in unique_tickers:
+        cached = read_cached_price_data(ticker)
+        if cached is not None:
+            cached_by_ticker[ticker] = cached
+
+        if ENABLE_PRICE_CACHE and cached is not None and not cache_needs_full_refresh(cached):
+            incremental_tickers.append(ticker)
+        else:
+            full_history_tickers.append(ticker)
+
+    print(
+        "Price cache: "
+        f"{len(incremental_tickers)} ticker(s) will use incremental refresh, "
+        f"{len(full_history_tickers)} ticker(s) need full history."
+    )
+
+    full_data, full_errors = download_price_batches(
+        full_history_tickers,
+        YFINANCE_PERIOD,
+        "full-history",
+    )
+    incremental_data, incremental_errors = download_price_batches(
+        incremental_tickers,
+        YFINANCE_INCREMENTAL_PERIOD,
+        "incremental",
+    )
+
+    price_data_by_ticker: dict[str, pd.DataFrame] = {}
+    errors_by_ticker: dict[str, str] = {}
+
+    for ticker in unique_tickers:
+        cached = cached_by_ticker.get(ticker)
+        if ticker in full_history_tickers:
+            fresh = full_data.get(ticker)
+            source_errors = full_errors
+        else:
+            fresh = incremental_data.get(ticker)
+            source_errors = incremental_errors
+
+        if fresh is not None and not fresh.empty:
+            merged = merge_price_data(cached, fresh)
+            if not merged.empty:
+                price_data_by_ticker[ticker] = merged
+                write_cached_price_data(ticker, merged)
+                continue
+
+        errors_by_ticker[ticker] = source_errors.get(
+            ticker,
+            "Yahoo Finance returned no OHLC data",
+        )
+
+    return price_data_by_ticker, errors_by_ticker
 
 
 def download_price_data(ticker: str) -> pd.DataFrame:
     """Download daily OHLCV data for one Yahoo Finance ticker."""
-    data = yf.download(
-        ticker,
-        period=YFINANCE_PERIOD,
-        interval="1d",
-        auto_adjust=YFINANCE_AUTO_ADJUST,
-        progress=False,
-        threads=False,
-    )
-    data = normalize_yfinance_columns(data, ticker)
-    if data.empty:
-        raise ValueError("Yahoo Finance returned no OHLC data")
-    return data
+    data_by_ticker, errors_by_ticker = download_price_data_bulk([ticker])
+    if ticker in data_by_ticker:
+        return data_by_ticker[ticker]
+    raise ValueError(errors_by_ticker.get(ticker, "Yahoo Finance returned no OHLC data"))
 
 
 def resample_ohlc(daily: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -509,12 +792,26 @@ def build_candidate_analyses(
     return analyses
 
 
-def scan_ticker(ticker: str) -> dict[str, Any]:
+def scan_ticker(
+    ticker: str,
+    daily: pd.DataFrame | None = None,
+    data_error: str | None = None,
+) -> dict[str, Any]:
     """Scan one ticker and return one result row."""
     print(f"Scanning {ticker}...")
 
     try:
-        daily = download_price_data(ticker)
+        if data_error is not None:
+            return empty_result(
+                ticker=ticker,
+                status="error",
+                message=f"{ticker}: price data error.",
+                error=data_error,
+            )
+
+        if daily is None:
+            daily = download_price_data(ticker)
+
         analyses = build_candidate_analyses(daily)
         if not analyses:
             return empty_result(
@@ -606,35 +903,54 @@ def format_price(value: Any) -> str:
     return "n/a" if number is None else f"{number:g}"
 
 
-def build_telegram_message(signals: list[dict[str, Any]]) -> str:
-    """Build one grouped Telegram alert message."""
-    sections = ["ALERT: Dominant MA/EMA Scanner Alerts"]
+def build_signal_telegram_section(result: dict[str, Any]) -> str:
+    """Build one ticker section for a Telegram alert."""
+    count_label = (
+        "Bounces"
+        if result["dominant_direction"] == "support"
+        else "Rejections"
+    )
+    return "\n".join(
+        [
+            str(result["ticker"]),
+            f"Signal: {human_signal_type(result['signal_type'])}",
+            "Dominant: "
+            f"{result['dominant_timeframe']} "
+            f"{result['dominant_length']}{result['dominant_average_type']}",
+            f"Close: {format_price(result['latest_close'])}",
+            f"Level: {format_price(result['dominant_value_latest'])}",
+            f"Score: {format_price(result['score'])}",
+            f"{count_label}: {result['bounce_count']}",
+            f"Bars streak: {result['bars_streak']}",
+        ]
+    )
+
+
+def build_telegram_messages(signals: list[dict[str, Any]]) -> list[str]:
+    """Build grouped Telegram alert messages under Telegram's text limit."""
+    header = "ALERT: Dominant MA/EMA Scanner Alerts"
+    messages: list[str] = []
+    current_message = header
 
     for result in signals:
-        count_label = (
-            "Bounces"
-            if result["dominant_direction"] == "support"
-            else "Rejections"
-        )
-        sections.append(
-            "\n".join(
-                [
-                    "",
-                    str(result["ticker"]),
-                    f"Signal: {human_signal_type(result['signal_type'])}",
-                    "Dominant: "
-                    f"{result['dominant_timeframe']} "
-                    f"{result['dominant_length']}{result['dominant_average_type']}",
-                    f"Close: {format_price(result['latest_close'])}",
-                    f"Level: {format_price(result['dominant_value_latest'])}",
-                    f"Score: {format_price(result['score'])}",
-                    f"{count_label}: {result['bounce_count']}",
-                    f"Bars streak: {result['bars_streak']}",
-                ]
-            )
-        )
+        section = build_signal_telegram_section(result)
+        candidate_message = f"{current_message}\n\n{section}"
+        if (
+            len(candidate_message) > TELEGRAM_MAX_MESSAGE_CHARS
+            and current_message != header
+        ):
+            messages.append(current_message)
+            current_message = f"{header}\n\n{section}"
+        else:
+            current_message = candidate_message
 
-    return "\n".join(sections)
+    messages.append(current_message)
+    return messages
+
+
+def build_telegram_message(signals: list[dict[str, Any]]) -> str:
+    """Build one grouped Telegram alert message for backward compatibility."""
+    return build_telegram_messages(signals)[0]
 
 
 def send_telegram_message(message: str) -> bool:
@@ -669,7 +985,8 @@ def maybe_send_telegram(results: list[dict[str, Any]]) -> None:
     """Send alerts for signal results, or optionally send a no-signal message."""
     signals = [result for result in results if result["status"] == "signal"]
     if signals:
-        send_telegram_message(build_telegram_message(signals))
+        for message in build_telegram_messages(signals):
+            send_telegram_message(message)
         return
 
     if SEND_NO_SIGNAL_MESSAGE:
@@ -689,7 +1006,15 @@ def main() -> None:
         maybe_send_telegram([])
         return
 
-    results = [scan_ticker(ticker) for ticker in tickers]
+    price_data_by_ticker, data_errors_by_ticker = download_price_data_bulk(tickers)
+    results = [
+        scan_ticker(
+            ticker,
+            daily=price_data_by_ticker.get(ticker),
+            data_error=data_errors_by_ticker.get(ticker),
+        )
+        for ticker in tickers
+    ]
     write_results(results)
     maybe_send_telegram(results)
 

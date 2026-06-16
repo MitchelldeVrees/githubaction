@@ -78,6 +78,8 @@ The first version uses `yfinance` because it is free and simple to run in GitHub
 
 Free Yahoo Finance data can be delayed, revised, rate limited, or temporarily unavailable. International tickers should use Yahoo suffixes, such as `ASML.AS` or `WKL.AS`.
 
+For larger ticker lists, the scanner downloads Yahoo data in batches, retries failed batches with backoff, waits briefly between batches, and stores daily OHLCV data in `.cache/yfinance`. GitHub Actions restores and saves that cache between runs, so after the first full-history scan, normal weekly runs only request recent incremental data for cached tickers.
+
 ## Edit Tickers
 
 Edit `tickers.txt` and put one Yahoo Finance ticker per line:
@@ -121,9 +123,21 @@ TICKERS_FILE=tickers.txt
 RESULTS_DIR=results
 YFINANCE_PERIOD=max
 YFINANCE_AUTO_ADJUST=true
+YFINANCE_INCREMENTAL_PERIOD=3mo
+YFINANCE_BATCH_SIZE=50
+YFINANCE_MAX_RETRIES=3
+YFINANCE_RETRY_SLEEP_SECONDS=10
+YFINANCE_BATCH_DELAY_SECONDS=2
+YFINANCE_THREADS=false
+ENABLE_PRICE_CACHE=true
+DATA_CACHE_DIR=.cache/yfinance
+CACHE_STALE_DAYS=45
+TELEGRAM_MAX_MESSAGE_CHARS=3900
 ```
 
 The code also has a `passes_confirmation_filters()` function where an optional RSI divergence filter can be added later without rewriting the scanner flow.
+
+For 300+ tickers, start with the defaults. If Yahoo starts rate-limiting, lower `YFINANCE_BATCH_SIZE` to `25` and raise `YFINANCE_BATCH_DELAY_SECONDS` to `5` or `10`. If a workflow has not run for more than `CACHE_STALE_DAYS`, cached tickers get a full-history refresh instead of an incremental refresh.
 
 ## Telegram Alerts
 
@@ -185,6 +199,7 @@ It:
 - Installs `requirements.txt`.
 - Runs `python scanner.py`.
 - Uploads CSV and JSON results as artifacts.
+- Restores and saves `.cache/yfinance` so large ticker lists do not need full-history downloads every week.
 - Can optionally commit updated result files back to the repository.
 
 The default schedule is:
