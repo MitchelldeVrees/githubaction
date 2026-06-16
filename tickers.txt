@@ -1,0 +1,7 @@
+# One Yahoo Finance ticker per line.
+# International tickers should use Yahoo suffixes, for example ASML.AS.
+AAPL
+MSFT
+NVDA
+ASML.AS
+WKL.AS

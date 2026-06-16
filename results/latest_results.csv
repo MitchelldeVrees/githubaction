@@ -1,0 +1,6 @@
+ticker,status,signal_type,dominant_timeframe,dominant_length,dominant_average_type,dominant_direction,latest_close,previous_close,dominant_value_latest,dominant_value_previous,score,bounce_count,bars_streak,message,error
+AAPL,no_signal,,Monthly,50,EMA,support,312.06,271.1003,207.3288,203.054,237.0,3,207,AAPL: no break on dominant Monthly 50EMA support.,
+MSFT,no_signal,,Monthly,50,SMA,support,450.24,406.8987,370.1214,367.0688,196.0,2,176,MSFT: no break on dominant Monthly 50SMA support.,
+NVDA,no_signal,,Biweekly,50,EMA,support,205.1,215.0793,156.1688,154.1716,139.0,5,89,NVDA: no break on dominant Biweekly 50EMA support.,
+ASML.AS,no_signal,,Quarterly,50,SMA,support,1116.7307,918.135,363.1856,342.1436,111.0,0,111,ASML.AS: no break on dominant Quarterly 50SMA support.,
+WKL.AS,no_signal,,Weekly,20,SMA,resistance,61.1,63.48,63.9801,65.0368,173.0,12,53,WKL.AS: no break on dominant Weekly 20SMA resistance.,
