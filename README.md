@@ -116,7 +116,7 @@ BEAR_BARS_REQUIRED=40
 TOUCH_DISTANCE_PCT=1.5
 BOUNCE_LOOKBACK=150
 BOUNCE_WEIGHT=10
-SEND_NO_SIGNAL_MESSAGE=false
+SEND_NO_SIGNAL_MESSAGE=true
 TICKERS_FILE=tickers.txt
 RESULTS_DIR=results
 YFINANCE_PERIOD=max
@@ -136,7 +136,13 @@ TELEGRAM_CHAT_ID
 
 If they are missing, the script does not crash. It still writes CSV and JSON results and prints a warning when it would otherwise send a Telegram message.
 
-If signals are found, one Telegram message is sent with all signals grouped together. If no signals are found, no Telegram message is sent by default. Set `SEND_NO_SIGNAL_MESSAGE=true` to send a short no-signal message.
+If signals are found, one Telegram message is sent with all signals grouped together. If no signals are found, the scanner sends:
+
+```text
+DominantAM has been run but nothing was found
+```
+
+Set `SEND_NO_SIGNAL_MESSAGE=false` if you want to turn that no-signal message off.
 
 ## Create Telegram Bot
 
@@ -173,7 +179,7 @@ The workflow is at `.github/workflows/scanner.yml`.
 
 It:
 
-- Runs on a weekday schedule.
+- Runs every Friday at 20:00 Europe/Amsterdam.
 - Supports manual runs through `workflow_dispatch`.
 - Uses Python 3.11.
 - Installs `requirements.txt`.
@@ -181,13 +187,14 @@ It:
 - Uploads CSV and JSON results as artifacts.
 - Can optionally commit updated result files back to the repository.
 
-The default cron is:
+The default schedule is:
 
 ```yaml
-cron: "30 20 * * 1-5"
+- cron: "0 18 * * 5"
+- cron: "0 19 * * 5"
 ```
 
-GitHub cron uses UTC. `20:30 UTC` is `22:30 Amsterdam` during daylight saving time. During winter, Amsterdam is UTC+1, so use `21:30 UTC` if you want exactly `22:30 Amsterdam`.
+GitHub cron uses UTC and does not understand Amsterdam daylight saving time. The workflow has two Friday cron entries and a small `Europe/Amsterdam` gate, so only the run that lands at Friday 20:00 Amsterdam actually scans.
 
 ## Manual Workflow Test
 

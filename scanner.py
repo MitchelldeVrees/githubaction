@@ -65,7 +65,7 @@ TOUCH_DISTANCE_PCT = env_float("TOUCH_DISTANCE_PCT", 1.5)
 BOUNCE_LOOKBACK = env_int("BOUNCE_LOOKBACK", 150)
 BOUNCE_WEIGHT = env_int("BOUNCE_WEIGHT", 10)
 
-SEND_NO_SIGNAL_MESSAGE = env_bool("SEND_NO_SIGNAL_MESSAGE", False)
+SEND_NO_SIGNAL_MESSAGE = env_bool("SEND_NO_SIGNAL_MESSAGE", True)
 TICKERS_FILE = env_path("TICKERS_FILE", "tickers.txt")
 RESULTS_DIR = env_path("RESULTS_DIR", "results")
 
@@ -673,7 +673,7 @@ def maybe_send_telegram(results: list[dict[str, Any]]) -> None:
         return
 
     if SEND_NO_SIGNAL_MESSAGE:
-        send_telegram_message("Dominant MA/EMA Scanner: no signals found.")
+        send_telegram_message("DominantAM has been run but nothing was found")
 
 
 def main() -> None:
