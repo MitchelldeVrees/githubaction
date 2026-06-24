@@ -9,7 +9,7 @@ GitHub Actions
   -> Telegram alert
 ```
 
-The scanner downloads daily Yahoo Finance data, resamples it into higher-timeframe candles, checks dominant SMA/EMA support and resistance levels, writes `results/latest_results.csv` and `results/latest_results.json`, and sends Telegram alerts when a dominant level breaks.
+The scanner downloads daily Yahoo Finance data, resamples it into higher-timeframe candles, checks dominant SMA/EMA support and resistance levels, writes `results/latest_results.csv` and `results/latest_results.json`, and sends Telegram alerts when a dominant level breaks or a completed candle closes near it.
 
 This is not financial advice.
 
@@ -70,6 +70,17 @@ previous_close <= previous_ma and latest_close > latest_ma
 
 Signal type: `break_above_dominant_resistance`
 
+For proximity alerts, the latest completed candle must close on the valid side
+of the dominant level and within `TOUCH_DISTANCE_PCT` of it:
+
+```text
+support: latest_close >= latest_ma and distance <= TOUCH_DISTANCE_PCT
+resistance: latest_close <= latest_ma and distance <= TOUCH_DISTANCE_PCT
+```
+
+Signal types: `near_dominant_support` and `near_dominant_resistance`. A break
+alert takes precedence over a proximity alert.
+
 The scanner uses only completed higher-timeframe candles. If the current weekly, biweekly, monthly, or quarterly candle is still open, it is excluded.
 
 ## Data
@@ -120,6 +131,7 @@ BOUNCE_LOOKBACK=150
 BOUNCE_WEIGHT=10
 SEND_NO_SIGNAL_MESSAGE=true
 TICKERS_FILE=tickers.txt
+SECURITY_IDENTIFIERS_FILE=security_identifiers.csv
 RESULTS_DIR=results
 YFINANCE_PERIOD=max
 YFINANCE_AUTO_ADJUST=true
@@ -136,6 +148,24 @@ TELEGRAM_MAX_MESSAGE_CHARS=3900
 ```
 
 The code also has a `passes_confirmation_filters()` function where an optional RSI divergence filter can be added later without rewriting the scanner flow.
+
+## Market and ISIN identifiers
+
+Each result and Telegram alert includes `market` and `isin`. The scanner infers
+the market from the Yahoo ticker suffix (for example, `.AS` is Euronext
+Amsterdam and `.T` is Tokyo); symbols without a suffix are reported as a US
+listing. Supply exact market names and ISINs in `security_identifiers.csv` to
+override that fallback:
+
+```csv
+ticker,market,isin
+ASML.AS,Euronext Amsterdam,NL0010273215
+AAPL,NASDAQ,US0378331005
+```
+
+Yahoo Finance price downloads do not consistently provide ISINs, so ISINs must
+be maintained in this mapping file. Rows may omit either value; the market
+fallback is still used when `market` is blank.
 
 For 300+ tickers, start with the defaults. If Yahoo starts rate-limiting, lower `YFINANCE_BATCH_SIZE` to `25` and raise `YFINANCE_BATCH_DELAY_SECONDS` to `5` or `10`. If a workflow has not run for more than `CACHE_STALE_DAYS`, cached tickers get a full-history refresh instead of an incremental refresh.
 
@@ -235,6 +265,8 @@ GitHub cron uses UTC and does not understand Amsterdam daylight saving time. The
 Each result contains:
 
 - `ticker`
+- `market`: configured market, or one inferred from the Yahoo ticker suffix
+- `isin`: configured ISIN, if supplied
 - `status`: `signal`, `no_signal`, or `error`
 - `signal_type`
 - `dominant_timeframe`

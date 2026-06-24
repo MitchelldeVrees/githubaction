@@ -1,0 +1,4 @@
+ticker,market,isin
+# Add one row per symbol when you need an exact market or ISIN.
+# ASML.AS,Euronext Amsterdam,NL0010273215
+# AAPL,NASDAQ,US0378331005

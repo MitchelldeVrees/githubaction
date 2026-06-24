@@ -71,6 +71,9 @@ BOUNCE_WEIGHT = env_int("BOUNCE_WEIGHT", 10)
 SEND_NO_SIGNAL_MESSAGE = env_bool("SEND_NO_SIGNAL_MESSAGE", True)
 TICKERS_FILE = env_path("TICKERS_FILE", "tickers.txt")
 RESULTS_DIR = env_path("RESULTS_DIR", "results")
+SECURITY_IDENTIFIERS_FILE = env_path(
+    "SECURITY_IDENTIFIERS_FILE", "security_identifiers.csv"
+)
 
 # yfinance with auto_adjust=True returns split/dividend adjusted OHLC values.
 YFINANCE_PERIOD = env_str("YFINANCE_PERIOD", "max")
@@ -112,6 +115,8 @@ OHLC_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
 RESULT_FIELDS = [
     "ticker",
+    "market",
+    "isin",
     "status",
     "signal_type",
     "dominant_timeframe",
@@ -128,6 +133,34 @@ RESULT_FIELDS = [
     "message",
     "error",
 ]
+
+# Yahoo Finance uses these suffixes for its most common international listings.
+# An unsuffixed symbol is normally a US listing, but an explicit mapping in
+# security_identifiers.csv should be used when the exact venue matters.
+YAHOO_SUFFIX_MARKETS = {
+    "AE": "Abu Dhabi Securities Exchange",
+    "AS": "Euronext Amsterdam",
+    "AX": "Australian Securities Exchange",
+    "BK": "Stock Exchange of Thailand",
+    "DE": "Xetra / Frankfurt",
+    "F": "Frankfurt Stock Exchange",
+    "HK": "Hong Kong Stock Exchange",
+    "KS": "Korea Exchange",
+    "L": "London Stock Exchange",
+    "MC": "Bolsa de Madrid",
+    "ME": "Moscow Exchange",
+    "MI": "Borsa Italiana",
+    "NS": "National Stock Exchange of India",
+    "PA": "Euronext Paris",
+    "SI": "Singapore Exchange",
+    "SR": "Saudi Exchange (Tadawul)",
+    "SS": "Shanghai Stock Exchange",
+    "ST": "Nasdaq Stockholm",
+    "SW": "SIX Swiss Exchange",
+    "SZ": "Shenzhen Stock Exchange",
+    "T": "Tokyo Stock Exchange",
+    "TW": "Taiwan Stock Exchange",
+}
 
 
 @dataclass(frozen=True)
@@ -175,6 +208,55 @@ def load_tickers(path: Path = TICKERS_FILE) -> list[str]:
             continue
         tickers.append(line.upper())
     return tickers
+
+
+def load_security_identifiers(
+    path: Path = SECURITY_IDENTIFIERS_FILE,
+) -> dict[str, dict[str, str]]:
+    """Load optional ticker, market, and ISIN mappings from a CSV file."""
+    if not path.exists():
+        return {}
+
+    with path.open(newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        required_columns = {"ticker", "market", "isin"}
+        if reader.fieldnames is None or not required_columns.issubset(reader.fieldnames):
+            raise ValueError(
+                f"{path} must contain the columns: ticker,market,isin"
+            )
+
+        identifiers: dict[str, dict[str, str]] = {}
+        for row in reader:
+            ticker = (row.get("ticker") or "").strip().upper()
+            if not ticker or ticker.startswith("#"):
+                continue
+            identifiers[ticker] = {
+                "market": (row.get("market") or "").strip(),
+                "isin": (row.get("isin") or "").strip(),
+            }
+    return identifiers
+
+
+def inferred_market(ticker: str) -> str:
+    """Return a readable market inferred from a Yahoo Finance ticker suffix."""
+    suffix = ticker.rsplit(".", 1)[-1] if "." in ticker else ""
+    if suffix in YAHOO_SUFFIX_MARKETS:
+        return YAHOO_SUFFIX_MARKETS[suffix]
+    if not suffix:
+        return "US listing (Yahoo Finance symbol has no suffix)"
+    return f"Yahoo Finance market suffix .{suffix}"
+
+
+def security_identity(
+    ticker: str,
+    identifiers: dict[str, dict[str, str]] | None = None,
+) -> dict[str, str | None]:
+    """Resolve explicit identifier data, falling back to the Yahoo market suffix."""
+    configured = (identifiers or {}).get(ticker.upper(), {})
+    return {
+        "market": configured.get("market") or inferred_market(ticker),
+        "isin": configured.get("isin") or None,
+    }
 
 
 def chunked(items: list[str], size: int) -> list[list[str]]:
@@ -699,6 +781,36 @@ def detect_break_signal(snapshot: DominantSnapshot) -> str | None:
     return None
 
 
+def detect_proximity_signal(snapshot: DominantSnapshot) -> str | None:
+    """Detect a completed candle closing near a dominant MA/EMA.
+
+    A support close must remain at or above its MA/EMA; a resistance close must
+    remain at or below it. This makes the proximity alert distinct from a break.
+    """
+    if snapshot.dominant_value_latest == 0:
+        return None
+
+    distance_pct = abs(
+        (snapshot.latest_close - snapshot.dominant_value_latest)
+        / snapshot.dominant_value_latest
+        * 100
+    )
+    if distance_pct > TOUCH_DISTANCE_PCT:
+        return None
+
+    if (
+        snapshot.direction == "support"
+        and snapshot.latest_close >= snapshot.dominant_value_latest
+    ):
+        return "near_dominant_support"
+    if (
+        snapshot.direction == "resistance"
+        and snapshot.latest_close <= snapshot.dominant_value_latest
+    ):
+        return "near_dominant_resistance"
+    return None
+
+
 def passes_confirmation_filters(snapshot: DominantSnapshot) -> bool:
     """Extension point for future filters, such as RSI divergence confirmation."""
     return True
@@ -721,10 +833,14 @@ def empty_result(
     status: str,
     message: str,
     error: str | None = None,
+    identifiers: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build an empty result row with all output fields."""
+    identity = security_identity(ticker, identifiers)
     return {
         "ticker": ticker,
+        "market": identity["market"],
+        "isin": identity["isin"],
         "status": status,
         "signal_type": None,
         "dominant_timeframe": None,
@@ -748,10 +864,14 @@ def result_from_snapshot(
     status: str,
     signal_type: str | None,
     message: str,
+    identifiers: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build a result row from a dominant candidate snapshot."""
+    identity = security_identity(snapshot.ticker, identifiers)
     return {
         "ticker": snapshot.ticker,
+        "market": identity["market"],
+        "isin": identity["isin"],
         "status": status,
         "signal_type": signal_type,
         "dominant_timeframe": snapshot.timeframe,
@@ -797,6 +917,7 @@ def scan_ticker(
     ticker: str,
     daily: pd.DataFrame | None = None,
     data_error: str | None = None,
+    identifiers: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Scan one ticker and return one result row."""
     print(f"Scanning {ticker}...")
@@ -808,6 +929,7 @@ def scan_ticker(
                 status="error",
                 message=f"{ticker}: price data error.",
                 error=data_error,
+                identifiers=identifiers,
             )
 
         if daily is None:
@@ -819,6 +941,7 @@ def scan_ticker(
                 ticker=ticker,
                 status="no_signal",
                 message="Not enough completed higher-timeframe data to analyze.",
+                identifiers=identifiers,
             )
 
         # Use the previous completed candle as the active dominant level for
@@ -838,10 +961,26 @@ def scan_ticker(
                     status="signal",
                     signal_type=signal_type,
                     message=message,
+                    identifiers=identifiers,
                 )
 
         current_dominant = select_dominant_level(ticker, analyses, as_of_pos=-1)
         if current_dominant is not None:
+            signal_type = detect_proximity_signal(current_dominant)
+            if signal_type is not None and passes_confirmation_filters(current_dominant):
+                message = (
+                    f"{ticker}: {human_signal_type(signal_type)} at "
+                    f"{current_dominant.timeframe} "
+                    f"{current_dominant.length}{current_dominant.average_type}."
+                )
+                return result_from_snapshot(
+                    current_dominant,
+                    status="signal",
+                    signal_type=signal_type,
+                    message=message,
+                    identifiers=identifiers,
+                )
+
             message = (
                 f"{ticker}: no break on dominant "
                 f"{current_dominant.timeframe} "
@@ -853,12 +992,14 @@ def scan_ticker(
                 status="no_signal",
                 signal_type=None,
                 message=message,
+                identifiers=identifiers,
             )
 
         return empty_result(
             ticker=ticker,
             status="no_signal",
             message="No dominant support or resistance level found.",
+            identifiers=identifiers,
         )
 
     except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the scan.
@@ -867,6 +1008,7 @@ def scan_ticker(
             status="error",
             message=f"{ticker}: scanner error.",
             error=str(exc),
+            identifiers=identifiers,
         )
 
 
@@ -895,6 +1037,10 @@ def human_signal_type(signal_type: str | None) -> str:
         return "Break below dominant support"
     if signal_type == "break_above_dominant_resistance":
         return "Break above dominant resistance"
+    if signal_type == "near_dominant_support":
+        return f"Close within {TOUCH_DISTANCE_PCT:g}% of dominant support"
+    if signal_type == "near_dominant_resistance":
+        return f"Close within {TOUCH_DISTANCE_PCT:g}% of dominant resistance"
     return "No signal"
 
 
@@ -914,6 +1060,8 @@ def build_signal_telegram_section(result: dict[str, Any]) -> str:
     return "\n".join(
         [
             str(result["ticker"]),
+            f"Market: {result['market']}",
+            f"ISIN: {result['isin'] or 'not configured'}",
             f"Signal: {human_signal_type(result['signal_type'])}",
             "Dominant: "
             f"{result['dominant_timeframe']} "
@@ -1041,12 +1189,18 @@ def main() -> None:
         maybe_send_telegram([])
         return
 
+    identifiers = load_security_identifiers()
+    print(
+        f"Security identifiers: {len(identifiers)} configured mapping(s) "
+        f"from {SECURITY_IDENTIFIERS_FILE}"
+    )
     price_data_by_ticker, data_errors_by_ticker = download_price_data_bulk(tickers)
     results = [
         scan_ticker(
             ticker,
             daily=price_data_by_ticker.get(ticker),
             data_error=data_errors_by_ticker.get(ticker),
+            identifiers=identifiers,
         )
         for ticker in tickers
     ]
