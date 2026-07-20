@@ -243,11 +243,11 @@ It:
 The default schedule is:
 
 ```yaml
-- cron: "0 18 * * 5"
-- cron: "0 19 * * 5"
+- cron: "0 20 * * 5"
+  timezone: "Europe/Amsterdam"
 ```
 
-GitHub cron uses UTC and does not understand Amsterdam daylight saving time. The workflow has two Friday cron entries and a small `Europe/Amsterdam` gate, so only the run that lands at Friday 20:00 Amsterdam actually scans.
+The timezone-aware schedule handles Amsterdam daylight saving time directly, so no additional runtime clock check is needed.
 
 ## Manual Workflow Test
 
