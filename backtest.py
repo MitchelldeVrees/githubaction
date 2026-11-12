@@ -856,6 +856,111 @@ def random_baseline(
                     "side": trade.side,
                     "timeframe": trade.timeframe,
                     "length": trade.length,
+                    "average_type": trade.average_type,
+                    "ticker": trade.ticker,
+                    "entry_date": pd.Timestamp(ohlc.index[position]).date().isoformat(),
+                    "exit_reason": reason,
+                    "return_pct": round(
+                        float(sign * (exit_price / entry - 1) * 100 - 2 * cost_pct), 3
+                    ),
+                    "r_multiple": round(
+                        float(sign * (exit_price - entry) / risk - 2 * cost_pct / 100 * entry / risk),
+                        3,
+                    ),
+                }
+            )
+    return rows
+
+
+def pullback_controls(
+    trades: list[Trade],
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    per_trade: int,
+    stop_atr: float,
+    max_candles: int,
+    cost_pct: float,
+    use_target: bool,
+) -> list[dict[str, Any]]:
+    """Control trades for pullbacks: same trend, random timing.
+
+    For every closed pullback trade, `per_trade` trades are entered at the close
+    of a random candle in which the same average was dominant in the same
+    direction, so the trend condition is identical but the entry does not wait
+    for a pullback. Stop, trailing and target follow the pullback rules. If
+    waiting for the pullback adds nothing, these trades should score about the
+    same as the real ones.
+    """
+    rows: list[dict[str, Any]] = []
+    for trade in trades:
+        if trade.setup != "pullback" or trade.exit_reason == "open":
+            continue
+        analysis = analyses[(trade.timeframe, trade.length, trade.average_type)]
+        ohlc = analysis.ohlc
+        open_, high, low, close = (
+            ohlc[column].to_numpy(dtype=float) for column in ("Open", "High", "Low", "Close")
+        )
+        dominant = analysis.ma.to_numpy(dtype=float)
+        atr = calculate_atr(ohlc)
+        long = trade.side == "long"
+        sign = 1.0 if long else -1.0
+        wanted = SUPPORT if long else RESISTANCE
+        candidates = np.flatnonzero(
+            (analysis.direction.to_numpy() == wanted) & np.isfinite(atr) & np.isfinite(dominant)
+        )
+        candidates = candidates[candidates < len(close) - 1]
+        if len(candidates) == 0:
+            continue
+        seed = zlib.crc32(f"{trade.ticker}|pullback|{trade.entry_date}".encode())
+        rng = np.random.default_rng(seed)
+        for position in rng.choice(candidates, size=per_trade):
+            entry = close[position]
+            stop = initial_stop = dominant[position] - sign * stop_atr * atr[position]
+            if sign * (entry - stop) <= 0:
+                continue
+            risk = abs(entry - stop)
+            target_series = None
+            for length in TARGET_LENGTHS if use_target else ():
+                if length == trade.length or position + 1 < length:
+                    continue
+                series = scanner.calculate_average(
+                    ohlc["Close"], length, trade.average_type
+                ).to_numpy(dtype=float)
+                value = series[position]
+                if not np.isfinite(value) or sign * (value - entry) <= 0:
+                    continue
+                if target_series is None or abs(value - entry) < abs(
+                    target_series[position] - entry
+                ):
+                    target_series = series
+            exit_price, reason = None, None
+            for k in range(position + 1, len(close)):
+                if np.isfinite(dominant[k - 1]) and np.isfinite(atr[k - 1]):
+                    level = dominant[k - 1] - sign * stop_atr * atr[k - 1]
+                    stop = max(stop, level) if long else min(stop, level)
+                if low[k] <= stop if long else high[k] >= stop:
+                    gapped = sign * (open_[k] - stop) <= 0
+                    exit_price = open_[k] if gapped else stop
+                    reason = "stop" if stop == initial_stop else "trail"
+                    break
+                if target_series is not None and (
+                    high[k] >= target_series[k - 1] if long else low[k] <= target_series[k - 1]
+                ):
+                    target = target_series[k - 1]
+                    gapped = sign * (open_[k] - target) >= 0
+                    exit_price, reason = (open_[k] if gapped else target), "target"
+                    break
+                if k - position >= max_candles:
+                    exit_price, reason = close[k], "time"
+                    break
+            if exit_price is None:
+                continue
+            rows.append(
+                {
+                    "setup": "pullback",
+                    "side": trade.side,
+                    "timeframe": trade.timeframe,
+                    "length": trade.length,
+                    "average_type": trade.average_type,
                     "ticker": trade.ticker,
                     "entry_date": pd.Timestamp(ohlc.index[position]).date().isoformat(),
                     "exit_reason": reason,
@@ -875,9 +980,9 @@ def baseline_summary(
     trades: list[Trade],
     baseline: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Compare real break and retracement trades with their random-date controls."""
+    """Compare real trades with their random-date controls, per setup and side."""
     result: dict[str, dict[str, Any]] = {}
-    for setup in ("break", "retracement"):
+    for setup in ("break", "pullback", "retracement"):
         for side in ("long", "short"):
             real = [
                 trade.r_multiple
@@ -894,12 +999,24 @@ def baseline_summary(
             ]
             if not real or not control:
                 continue
+            real_pct = [
+                trade.return_pct
+                for trade in trades
+                if trade.setup == setup and trade.side == side and trade.exit_reason != "open"
+            ]
+            control_pct = [
+                row["return_pct"]
+                for row in baseline
+                if row["setup"] == setup and row["side"] == side
+            ]
             result[f"{setup} {side}"] = {
                 "signal_trades": len(real),
                 "signal_avg_r": round(float(np.mean(real)), 3),
+                "signal_avg_return_pct": round(float(np.mean(real_pct)), 3),
                 "signal_win_rate_pct": round(float(np.mean(np.array(real) > 0) * 100), 1),
                 "random_trades": len(control),
                 "random_avg_r": round(float(np.mean(control)), 3),
+                "random_avg_return_pct": round(float(np.mean(control_pct)), 3),
                 "random_win_rate_pct": round(float(np.mean(np.array(control) > 0) * 100), 1),
             }
     return result
@@ -1119,7 +1236,7 @@ def parse_args() -> argparse.Namespace:
         "--baseline",
         type=int,
         default=0,
-        help="random-date control trades per break and retracement trade (0: off)",
+        help="random-date control trades per trade (0: off)",
     )
     parser.add_argument(
         "--max-daily-jump",
@@ -1192,13 +1309,21 @@ def main() -> None:
         trades.extend(ticker_trades)
         skipped += ticker_skipped
         if args.baseline > 0:
+            analyses = scanner.build_candidate_analyses(daily)
             baseline.extend(
                 random_baseline(
+                    ticker_trades, analyses, args.baseline, args.max_candles, args.cost_pct
+                )
+            )
+            baseline.extend(
+                pullback_controls(
                     ticker_trades,
-                    scanner.build_candidate_analyses(daily),
+                    analyses,
                     args.baseline,
+                    args.pullback_stop_atr,
                     args.max_candles,
                     args.cost_pct,
+                    use_target=args.pullback_target == "next",
                 )
             )
 
@@ -1243,11 +1368,13 @@ def main() -> None:
             writer = csv.DictWriter(handle, fieldnames=list(baseline[0]))
             writer.writeheader()
             writer.writerows(baseline)
-        print("\nSignal against random dates with the same stop and target distances:")
+        print("\nSignal against its random-date controls (see --baseline):")
         for name, row in summary["random_baseline"].items():
             print(
-                f"{name:<20} signal {row['signal_avg_r']:+.3f} R ({row['signal_trades']}), "
-                f"random {row['random_avg_r']:+.3f} R ({row['random_trades']})"
+                f"{name:<20} signal {row['signal_avg_r']:+.3f} R "
+                f"{row['signal_avg_return_pct']:+.2f}% ({row['signal_trades']}), "
+                f"random {row['random_avg_r']:+.3f} R "
+                f"{row['random_avg_return_pct']:+.2f}% ({row['random_trades']})"
             )
     if errors:
         with (args.out / "errors.json").open("w", encoding="utf-8") as handle:

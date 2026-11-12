@@ -223,3 +223,17 @@ def test_pullback_without_target_rides_the_trend():
     assert riding and all(trade.target == "none" for trade in riding)
     assert {trade.exit_reason for trade in riding} <= {"stop", "trail", "time", "open"}
     assert len(riding) <= len(with_target)
+
+
+def test_pullback_controls_enter_only_while_the_level_is_dominant():
+    daily = random_daily(6)
+    analyses = scanner.build_candidate_analyses(daily)
+    trades = backtest.find_pullbacks("TEST", analyses, use_target=False)
+    rows = backtest.pullback_controls(trades, analyses, 3, 0.75, 104, 0.1, use_target=False)
+    assert rows
+    for row in rows[:40]:
+        analysis = analyses[(row["timeframe"], row["length"], row["average_type"])]
+        position = analysis.ohlc.index.get_loc(pd.Timestamp(row["entry_date"]))
+        wanted = backtest.SUPPORT if row["side"] == "long" else backtest.RESISTANCE
+        assert analysis.direction.iloc[position] == wanted
+    assert {row["exit_reason"] for row in rows} <= {"stop", "trail", "time"}

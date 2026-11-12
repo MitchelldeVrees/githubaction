@@ -204,7 +204,10 @@ jump is listed in `data_flags.csv`.
 
 `--baseline N` adds a control: for every closed break and retracement trade, N
 trades in the same ticker, timeframe and direction at random dates, with the
-stop and target at the same percentage distance. They are written to
+stop and target at the same percentage distance. For every pullback trade, N
+trades entered at random candles in which the same average was dominant in the
+same direction, with the pullback's stop, trailing and target rules; this asks
+whether waiting for the pullback beats entering anywhere in the same trend. They are written to
 `baseline_trades.csv` and compared with the real trades in the summary. Because
 the control trades come from the same stocks, it separates the signal's effect
 from the drift of the stock universe, including the survivor effect.
