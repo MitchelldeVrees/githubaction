@@ -21,6 +21,10 @@ Trade rules (JDB component 1, break of the dominant average):
 - A trade still open after --max-candles candles exits at that candle's close.
   A trade still open at the end of the data is reported as open.
 
+Pullback trades (JDB component 1, signal B) are simulated as well, see
+simulate_pullback: while an average is dominant, price coming back to it is an
+entry just on the trend side of the average with a stop just beyond it.
+
 Each trade also records RSI and RSI divergence on the break candle, as defined
 in scanner.find_divergence. Divergence does not filter any trade; the summary
 compares trades with and without divergence in the trade's direction.
@@ -73,6 +77,7 @@ class Signal:
 class Trade:
     """Outcome of trading one signal."""
 
+    setup: str  # "break" or "pullback"
     ticker: str
     side: str
     timeframe: str
@@ -88,7 +93,7 @@ class Trade:
     entry_date: str
     entry_price: float
     target: str
-    target_at_entry: float
+    target_at_entry: float | None
     stop_at_entry: float | None
     exit_date: str
     exit_price: float
@@ -204,6 +209,263 @@ def iter_run_signals(
             break  # the first hierarchy step with a dominant level decides
 
 
+@dataclass(frozen=True)
+class Setup:
+    """A dominant level at the moment one of its candles has just completed."""
+
+    ticker: str
+    run_date: pd.Timestamp
+    timeframe: str
+    length: int
+    average_type: str
+    direction: int  # SUPPORT or RESISTANCE
+    position: int  # index of the last completed candle; a pullback enters in the next
+
+
+def iter_dominant_levels(
+    ticker: str,
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    every_run_date: bool = False,
+) -> Iterator[Setup]:
+    """Yield the scanner's dominant level each time a new candle of it completes.
+
+    For each weekly run date this mirrors scanner.select_dominant_level with
+    as_of_pos=-1, using only candles completed on or before that date. A level
+    is yielded once per candle of its own timeframe, or on every run date with
+    `every_run_date`.
+    """
+    weekly = next(
+        (a for (timeframe, _, _), a in analyses.items() if timeframe == "Weekly"),
+        None,
+    )
+    if weekly is None:
+        return
+
+    arrays = candidate_arrays(analyses)
+    run_dates = weekly.ohlc.index.to_numpy()
+    positions = {
+        timeframe: np.searchsorted(
+            next(a.ohlc.index.to_numpy() for (tf, _, _), a in analyses.items() if tf == timeframe),
+            run_dates,
+            side="right",
+        )
+        - 1
+        for timeframe in {key[0] for key in analyses}
+    }
+
+    seen: set[tuple[str, int]] = set()
+    for run_index in range(len(run_dates)):
+        for timeframe, length in scanner.HIERARCHY:
+            if timeframe not in positions:
+                continue
+            latest = int(positions[timeframe][run_index])
+            if latest < 1:
+                continue
+
+            best: tuple[str, dict[str, np.ndarray]] | None = None
+            for average_type in scanner.AVERAGE_TYPES:
+                data = arrays.get((timeframe, length, average_type))
+                if data is None or data["direction"][latest] == 0:
+                    continue
+                if not (
+                    np.isfinite(data["ma"][latest])
+                    and np.isfinite(data["ma"][latest - 1])
+                    and data["score"][latest] > 0
+                ):
+                    continue
+                if best is None or data["score"][latest] > best[1]["score"][latest]:
+                    best = (average_type, data)
+
+            if best is None:
+                continue
+            if every_run_date or (timeframe, latest) not in seen:
+                seen.add((timeframe, latest))
+                yield Setup(
+                    ticker=ticker,
+                    run_date=pd.Timestamp(run_dates[run_index]),
+                    timeframe=timeframe,
+                    length=length,
+                    average_type=best[0],
+                    direction=int(best[1]["direction"][latest]),
+                    position=latest,
+                )
+            break  # the first hierarchy step with a dominant level decides
+
+
+def simulate_pullback(
+    setup: Setup,
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    entry_pct: float,
+    stop_pct: float,
+    max_candles: int,
+    cost_pct: float,
+) -> Trade | None:
+    """Simulate a pullback to the dominant average in the candle after `setup`.
+
+    Long at dominant support (short at dominant resistance is the mirror image):
+
+    - Entry when the next candle trades down to `entry_pct` above the average.
+      A candle that opens below that level is entered at its open, unless it
+      opens beyond the stop.
+    - Stop `stop_pct` below the average. It follows the average from candle to
+      candle and only ever tightens.
+    - Target is the nearest other average (20, 50 or 200, same SMA/EMA type)
+      above the entry. With no average above, there is no target and the stop
+      alone ends the trade.
+
+    The average of the last completed candle is used for the entry and stop of
+    the candle being traded. Returns None when the candle never reaches the
+    entry level.
+    """
+    analysis = analyses[(setup.timeframe, setup.length, setup.average_type)]
+    ohlc = analysis.ohlc
+    known = setup.position
+    entry_at = known + 1
+    if entry_at >= len(ohlc):
+        return None
+
+    dates = ohlc.index
+    open_, high, low, close = (
+        ohlc[column].to_numpy(dtype=float) for column in ("Open", "High", "Low", "Close")
+    )
+    dominant = analysis.ma.to_numpy(dtype=float)
+    long = setup.direction == SUPPORT
+    sign = 1.0 if long else -1.0
+
+    def beyond(level: float, pct: float) -> float:
+        """Move a level `pct` percent in the trade's direction (negative: against)."""
+        return level * (1 + sign * pct / 100)
+
+    entry_level = beyond(dominant[known], entry_pct)
+    stop = initial_stop = beyond(dominant[known], -stop_pct)
+
+    def reached(index: int, level: float, favorable: bool) -> bool:
+        """Whether candle `index` traded at `level` on the profit or loss side."""
+        if favorable == long:
+            return bool(high[index] >= level)
+        return bool(low[index] <= level)
+
+    if not reached(entry_at, entry_level, favorable=False):
+        return None
+    opened_through = sign * (open_[entry_at] - entry_level) <= 0
+    entry = open_[entry_at] if opened_through else entry_level
+    if sign * (entry - stop) <= 0:
+        return None  # opened beyond the stop: there was no pullback to trade
+    risk = abs(entry - stop)
+
+    target_length = None
+    target_series = None
+    for length in TARGET_LENGTHS:
+        if length == setup.length or known + 1 < length:
+            continue
+        series = scanner.calculate_average(
+            ohlc["Close"], length, setup.average_type
+        ).to_numpy(dtype=float)
+        value = series[known]
+        if not np.isfinite(value) or sign * (value - entry) <= 0:
+            continue
+        if target_series is None or abs(value - entry) < abs(target_series[known] - entry):
+            target_length, target_series = length, series
+
+    exit_at, exit_price, reason = len(close) - 1, close[-1], "open"
+    if reached(entry_at, stop, favorable=False):
+        # Price fell through the entry and on to the stop within the same candle.
+        exit_at, exit_price, reason = entry_at, stop, "stop"
+    else:
+        for k in range(entry_at + 1, len(close)):
+            if np.isfinite(dominant[k - 1]):
+                level = beyond(dominant[k - 1], -stop_pct)
+                stop = max(stop, level) if long else min(stop, level)
+            if reached(k, stop, favorable=False):
+                gapped = sign * (open_[k] - stop) <= 0
+                reason = "stop" if stop == initial_stop else "trail"
+                exit_at, exit_price = k, (open_[k] if gapped else stop)
+                break
+            if target_series is not None and reached(k, target_series[k - 1], favorable=True):
+                target = target_series[k - 1]
+                gapped = sign * (open_[k] - target) >= 0
+                exit_at, exit_price, reason = k, (open_[k] if gapped else target), "target"
+                break
+            if k - entry_at >= max_candles:
+                exit_at, exit_price, reason = k, close[k], "time"
+                break
+
+    return_pct = sign * (exit_price / entry - 1) * 100 - 2 * cost_pct
+    r_multiple = sign * (exit_price - entry) / risk - 2 * cost_pct / 100 * entry / risk
+    divergence = scanner.divergence_context(ohlc, known)
+
+    return Trade(
+        setup="pullback",
+        ticker=setup.ticker,
+        side="long" if long else "short",
+        timeframe=setup.timeframe,
+        length=setup.length,
+        average_type=setup.average_type,
+        bars_streak=int(analysis.bars_streak.iloc[known]),
+        streak_touches=int(analysis.streak_touches.iloc[known]),
+        faulty_candles=int(analysis.faulty_candles.iloc[known]),
+        score=round(float(analysis.score.iloc[known]), 2),
+        rsi_at_entry=divergence["rsi"],
+        negative_divergence=divergence["negative_divergence"],
+        positive_divergence=divergence["positive_divergence"],
+        entry_date=pd.Timestamp(dates[entry_at]).date().isoformat(),
+        entry_price=round(float(entry), 4),
+        target=(
+            "none"
+            if target_series is None
+            else f"{setup.timeframe} {target_length}{setup.average_type}"
+        ),
+        target_at_entry=(
+            None if target_series is None else round(float(target_series[known]), 4)
+        ),
+        stop_at_entry=round(float(initial_stop), 4),
+        exit_date=pd.Timestamp(dates[exit_at]).date().isoformat(),
+        exit_price=round(float(exit_price), 4),
+        exit_reason=reason,
+        candles_held=exit_at - entry_at,
+        return_pct=round(float(return_pct), 3),
+        r_multiple=round(float(r_multiple), 3),
+    )
+
+
+def find_pullbacks(
+    ticker: str,
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    entry_pct: float = 1.0,
+    stop_pct: float = 2.0,
+    max_candles: int = 104,
+    cost_pct: float = 0.1,
+    max_attempts: int = 3,
+    attempt_window: int = 26,
+) -> list[Trade]:
+    """Trade every pullback to the dominant level, one position per level at a time.
+
+    After `max_attempts` losing pullbacks in a row on the same level, no further
+    attempt is made until `attempt_window` candles have passed since the last.
+    """
+    trades: list[Trade] = []
+    busy_until: dict[tuple[str, int, str], int] = {}
+    losses: dict[tuple[str, int, str], tuple[int, int]] = {}  # (count, last entry candle)
+    for setup in iter_dominant_levels(ticker, analyses):
+        level = (setup.timeframe, setup.length, setup.average_type)
+        entry_at = setup.position + 1
+        if entry_at <= busy_until.get(level, -1):
+            continue
+        count, last_entry = losses.get(level, (0, -attempt_window))
+        if count >= max_attempts:
+            if entry_at - last_entry <= attempt_window:
+                continue
+            count = 0
+
+        trade = simulate_pullback(setup, analyses, entry_pct, stop_pct, max_candles, cost_pct)
+        if trade is None:
+            continue
+        trades.append(trade)
+        busy_until[level] = entry_at + trade.candles_held
+        losses[level] = (count + 1, entry_at) if trade.return_pct <= 0 else (0, entry_at)
+    return trades
+
+
 def find_signals(
     ticker: str,
     analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
@@ -301,6 +563,7 @@ def simulate_trade(
     divergence = scanner.divergence_context(ohlc, entry_at)
 
     return Trade(
+        setup="break",
         ticker=signal.ticker,
         side="short" if short else "long",
         timeframe=signal.timeframe,
@@ -336,12 +599,28 @@ def backtest_ticker(
     stop_buffer_pct: float = 0.5,
     start: pd.Timestamp | None = None,
     trail_after_r: float = 1.0,
+    setups: tuple[str, ...] = ("break",),
+    pullback_entry_pct: float = 1.0,
+    pullback_stop_pct: float = 2.0,
 ) -> tuple[list[Trade], int]:
     """Backtest one ticker. Returns its trades and the number of untradable breaks."""
     analyses = scanner.build_candidate_analyses(daily)
     trades: list[Trade] = []
     skipped = 0
-    for signal in find_signals(ticker, analyses):
+    if "pullback" in setups:
+        trades.extend(
+            trade
+            for trade in find_pullbacks(
+                ticker,
+                analyses,
+                entry_pct=pullback_entry_pct,
+                stop_pct=pullback_stop_pct,
+                max_candles=max_candles,
+                cost_pct=cost_pct,
+            )
+            if start is None or pd.Timestamp(trade.entry_date) >= start
+        )
+    for signal in find_signals(ticker, analyses) if "break" in setups else []:
         if start is not None and signal.run_date < start:
             continue
         trade = simulate_trade(
@@ -403,20 +682,20 @@ def confirming_divergence(trade: Trade) -> bool | None:
 
 
 def grouped_summary(trades: list[Trade]) -> dict[str, dict[str, Any]]:
-    """Summaries overall, per side, per divergence, and per dominant level."""
+    """Summaries overall and per setup: by side, by divergence, by dominant level."""
     groups: dict[str, list[Trade]] = {"all": trades}
     for trade in trades:
-        groups.setdefault(trade.side, []).append(trade)
+        side = f"{trade.setup} {trade.side}"
+        groups.setdefault(side, []).append(trade)
         confirmed = confirming_divergence(trade)
-        if confirmed is not None:
+        if trade.setup == "break" and confirmed is not None:
             label = "with" if confirmed else "without"
-            groups.setdefault(f"{trade.side} {label} divergence", []).append(trade)
-        level = f"{trade.side} / {trade.timeframe} {trade.length}"
-        groups.setdefault(level, []).append(trade)
+            groups.setdefault(f"{side} {label} divergence", []).append(trade)
+        groups.setdefault(f"{side} / {trade.timeframe} {trade.length}", []).append(trade)
 
     def order(name: str) -> tuple[str, int, str]:
         rank = 2 if " / " in name else 1 if name.endswith("divergence") else 0
-        return (name.split(" ")[0], rank, name)
+        return (" ".join(name.split(" ")[:2]), rank, name)
 
     ordered = ["all"] + sorted((key for key in groups if key != "all"), key=order)
     return {key: summarize(groups[key]) for key in ordered}
@@ -442,7 +721,7 @@ def write_outputs(
 def print_summary(summary: dict[str, Any]) -> None:
     """Print the grouped summary as a table."""
     header = (
-        f"{'group':<26}{'trades':>7}{'win%':>7}{'avg win':>9}{'avg loss':>10}"
+        f"{'group':<36}{'trades':>7}{'win%':>7}{'avg win':>9}{'avg loss':>10}"
         f"{'expect%':>9}{'avg R':>7}{'held':>6}{'streak':>8}"
     )
     print(header)
@@ -453,7 +732,7 @@ def print_summary(summary: dict[str, Any]) -> None:
 
     for name, row in summary["groups"].items():
         print(
-            f"{name:<26}{row['closed_trades']:>7}"
+            f"{name:<36}{row['closed_trades']:>7}"
             + cell(row["win_rate_pct"], 7)
             + cell(row["avg_win_pct"], 9)
             + cell(row["avg_loss_pct"], 10)
@@ -475,6 +754,24 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="with --stop trail: profit, in units of initial risk, before the stop trails",
     )
+    parser.add_argument(
+        "--setups",
+        default="break,pullback",
+        help="comma-separated: break (close through the dominant average), "
+        "pullback (return to the dominant average)",
+    )
+    parser.add_argument(
+        "--pullback-entry-pct",
+        type=float,
+        default=1.0,
+        help="pullback entry, in percent on the trend side of the dominant average",
+    )
+    parser.add_argument(
+        "--pullback-stop-pct",
+        type=float,
+        default=2.0,
+        help="pullback stop, in percent beyond the dominant average",
+    )
     parser.add_argument("--stop-buffer-pct", type=float, default=0.5)
     parser.add_argument("--max-candles", type=int, default=104)
     parser.add_argument("--cost-pct", type=float, default=0.1, help="cost per side, in percent")
@@ -485,6 +782,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     start = pd.Timestamp(args.start) if args.start else None
+    setups = tuple(name.strip() for name in args.setups.split(",") if name.strip())
+    unknown = set(setups) - {"break", "pullback"}
+    if unknown:
+        raise SystemExit(f"Unknown setup: {', '.join(sorted(unknown))}")
     tickers = scanner.load_tickers(args.tickers_file)
     price_data, errors = scanner.download_price_data_bulk(tickers)
 
@@ -504,6 +805,9 @@ def main() -> None:
                 stop_buffer_pct=args.stop_buffer_pct,
                 start=start,
                 trail_after_r=args.trail_after_r,
+                setups=setups,
+                pullback_entry_pct=args.pullback_entry_pct,
+                pullback_stop_pct=args.pullback_stop_pct,
             )
         except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the run.
             errors[ticker] = str(exc)
@@ -513,6 +817,9 @@ def main() -> None:
 
     summary = {
         "settings": {
+            "setups": list(setups),
+            "pullback_entry_pct": args.pullback_entry_pct,
+            "pullback_stop_pct": args.pullback_stop_pct,
             "stop": args.stop,
             "stop_buffer_pct": args.stop_buffer_pct,
             "trail_after_r": args.trail_after_r if args.stop == "trail" else None,
@@ -535,6 +842,7 @@ def main() -> None:
     print(
         f"\n{len(trades)} trades from {len(tickers) - len(errors)} tickers; "
         f"{skipped} breaks had no average left to target; {len(errors)} tickers failed."
+
     )
     print(f"Wrote {args.out / 'backtest_trades.csv'} and {args.out / 'backtest_summary.json'}")
 
