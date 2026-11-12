@@ -27,8 +27,16 @@ jobs:
         include:
           - name: adjusted
             auto_adjust: "true"
+            cache: adjusted
+            args: ""
           - name: raw
             auto_adjust: "false"
+            cache: raw
+            args: ""
+          - name: adjusted_pullback_ride
+            auto_adjust: "true"
+            cache: adjusted
+            args: "--setups pullback --pullback-target none"
 
     steps:
       - name: Check out repository
@@ -38,11 +46,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .cache/yfinance
-          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.name }}-${{ github.run_id }}
+          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.cache }}-${{ matrix.name }}-${{ github.run_id }}
           restore-keys: |
-            yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.name }}-
-            yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-
-            yfinance-price-cache-${{ runner.os }}-
+            yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.cache }}-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -58,14 +64,14 @@ jobs:
           YFINANCE_AUTO_ADJUST: ${{ matrix.auto_adjust }}
           YFINANCE_BATCH_SIZE: "25"
           YFINANCE_BATCH_DELAY_SECONDS: "5"
-        run: python backtest.py --out results/backtest_${{ matrix.name }}
+        run: python backtest.py --out results/backtest_${{ matrix.name }} ${{ matrix.args }}
 
       - name: Save Yahoo price cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .cache/yfinance
-          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.name }}-${{ github.run_id }}
+          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.cache }}-${{ matrix.name }}-${{ github.run_id }}
 
       - name: Upload results
         if: always()

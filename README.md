@@ -171,7 +171,8 @@ Three entries are simulated, chosen with `--setups` (default
   a monthly stop sits further from the average than a weekly one and a volatile
   stock gets more room than a quiet one. The stop follows the average and only
   tightens. The target is the nearest other average above the entry; when price
-  is above all of them there is no target and the trailed stop ends the trade.
+  is above all of them, or with `--pullback-target none`, there is no target
+  and the trailed stop ends the trade.
   Dominant resistance is the mirror image, a short. One position per idea at a
   time, where the SMA and EMA of the same timeframe and length are one idea;
   after three losing attempts in a row on an idea, no new attempt for 26

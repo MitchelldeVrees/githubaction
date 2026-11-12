@@ -322,6 +322,7 @@ def simulate_pullback(
     stop_atr: float,
     max_candles: int,
     cost_pct: float,
+    use_target: bool = True,
 ) -> Trade | None:
     """Simulate a pullback to the dominant average in the candle after `setup`.
 
@@ -336,8 +337,8 @@ def simulate_pullback(
     - Stop `stop_atr` ATR below the average. It follows the average from candle
       to candle and only ever tightens.
     - Target is the nearest other average (20, 50 or 200, same SMA/EMA type)
-      above the entry. With no average above, there is no target and the stop
-      alone ends the trade.
+      above the entry. With no average above, or with `use_target` off, there is
+      no target and the trailed stop alone ends the trade.
 
     The average of the last completed candle is used for the entry and stop of
     the candle being traded. Returns None when the candle never reaches the
@@ -384,7 +385,7 @@ def simulate_pullback(
 
     target_length = None
     target_series = None
-    for length in TARGET_LENGTHS:
+    for length in TARGET_LENGTHS if use_target else ():
         if length == setup.length or known + 1 < length:
             continue
         series = scanner.calculate_average(
@@ -466,6 +467,7 @@ def find_pullbacks(
     cost_pct: float = 0.1,
     max_attempts: int = 3,
     attempt_window: int = 26,
+    use_target: bool = True,
 ) -> list[Trade]:
     """Trade every pullback to the dominant level, one position per idea at a time.
 
@@ -488,7 +490,9 @@ def find_pullbacks(
                 continue
             count = 0
 
-        trade = simulate_pullback(setup, analyses, entry_atr, stop_atr, max_candles, cost_pct)
+        trade = simulate_pullback(
+            setup, analyses, entry_atr, stop_atr, max_candles, cost_pct, use_target
+        )
         if trade is None:
             continue
         trades.append(trade)
@@ -804,6 +808,7 @@ def backtest_ticker(
     pullback_stop_atr: float = 0.75,
     retrace_max_wait: int = 52,
     retrace_attempts: int = 3,
+    pullback_target: str = "next",
 ) -> tuple[list[Trade], int]:
     """Backtest one ticker. Returns its trades and the number of untradable breaks."""
     analyses = scanner.build_candidate_analyses(daily)
@@ -835,6 +840,7 @@ def backtest_ticker(
                 stop_atr=pullback_stop_atr,
                 max_candles=max_candles,
                 cost_pct=cost_pct,
+                use_target=pullback_target == "next",
             )
             if start is None or pd.Timestamp(trade.entry_date) >= start
         )
@@ -980,6 +986,13 @@ def parse_args() -> argparse.Namespace:
         "retracement (short at 50%% after a break below dominant support)",
     )
     parser.add_argument(
+        "--pullback-target",
+        choices=("next", "none"),
+        default="next",
+        help="next: exit a pullback at the nearest other average; "
+        "none: no target, ride the trend with the trailed stop",
+    )
+    parser.add_argument(
         "--retrace-max-wait",
         type=int,
         default=52,
@@ -1053,6 +1066,7 @@ def main() -> None:
                 pullback_stop_atr=args.pullback_stop_atr,
                 retrace_max_wait=args.retrace_max_wait,
                 retrace_attempts=args.retrace_attempts,
+                pullback_target=args.pullback_target,
             )
         except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the run.
             errors[ticker] = str(exc)
@@ -1065,6 +1079,7 @@ def main() -> None:
             "setups": list(setups),
             "pullback_entry_atr": args.pullback_entry_atr,
             "pullback_stop_atr": args.pullback_stop_atr,
+            "pullback_target": args.pullback_target,
             "retrace_max_wait": args.retrace_max_wait,
             "retrace_attempts": args.retrace_attempts,
             "max_daily_jump": args.max_daily_jump,
