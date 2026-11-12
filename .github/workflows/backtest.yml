@@ -10,6 +10,7 @@ on:
     paths:
       - backtest.py
       - scanner.py
+      - tickers_indices.txt
       - .github/workflows/backtest.yml
   workflow_dispatch:
 
@@ -45,6 +46,14 @@ jobs:
             auto_adjust: "true"
             cache: adjusted
             args: "--setups pullback --pullback-target none --baseline 3"
+          - name: indices
+            auto_adjust: "true"
+            cache: indices
+            args: "--tickers-file tickers_indices.txt --baseline 5"
+          - name: indices_pullback_ride
+            auto_adjust: "true"
+            cache: indices
+            args: "--tickers-file tickers_indices.txt --setups pullback --pullback-target none --baseline 3"
 
     steps:
       - name: Check out repository

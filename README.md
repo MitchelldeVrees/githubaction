@@ -221,6 +221,14 @@ Output goes to `results/backtest/`: `backtest_trades.csv` with every trade and
 `backtest_summary.json` with win rate, average win and loss, expectancy, average
 R, holding time and the longest losing streak, overall and per dominant level.
 
+`tickers_indices.txt` holds indices, sector and bond ETFs, commodities and
+crypto. JDB applies the strategy to all of these, and an index does not carry
+the survivor effect of a list of today's largest companies:
+
+```bash
+python backtest.py --tickers-file tickers_indices.txt --out results/backtest_indices
+```
+
 Read the results with these limits in mind:
 
 - `tickers.txt` holds companies that exist today. Companies that failed are

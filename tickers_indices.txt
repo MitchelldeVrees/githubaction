@@ -1,0 +1,54 @@
+# Indices, sector ETFs, commodities and crypto for backtest.py.
+# JDB applies the strategy to indices, commodities, bonds and Bitcoin as well as
+# shares, and an index has no survivor effect of its own the way a list of
+# today's largest companies does. Run with:
+#   python backtest.py --tickers-file tickers_indices.txt
+#
+# US indices
+^GSPC
+^DJI
+^IXIC
+^NDX
+^RUT
+^SOX
+# Other indices
+^N225
+^GDAXI
+^FTSE
+^FCHI
+^AEX
+^STOXX50E
+^HSI
+000001.SS
+^BSESN
+^KS11
+^TWII
+^AXJO
+^GSPTSE
+^BVSP
+^MXX
+# US sector, bond and country ETFs
+XLK
+XLF
+XLE
+XLV
+XLY
+XLP
+XLI
+XLU
+XLB
+SMH
+TLT
+IEF
+EEM
+EWJ
+FXI
+# Commodities (continuous futures) and crypto
+GC=F
+SI=F
+HG=F
+CC=F
+KC=F
+SB=F
+BTC-USD
+ETH-USD
