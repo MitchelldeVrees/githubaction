@@ -160,6 +160,26 @@ candles (default 104) exits at the close. Costs default to 0.1% per side.
 to just beyond the dominant average and follows it, only ever tightening. Exits
 on the moved stop are counted as `trail` in the summary.
 
+Two entries are simulated, chosen with `--setups` (default `break,pullback`):
+
+- `break`: the close through the dominant average described above.
+- `pullback`: while an average is dominant, price coming back to it. For
+  dominant support this is a long: entry `--pullback-entry-pct` (default 1%)
+  above the average, stop `--pullback-stop-pct` (default 2%) below it. The stop
+  follows the average and only tightens. The target is the nearest other average
+  above the entry; when price is above all of them there is no target and the
+  trailed stop ends the trade. Dominant resistance is the mirror image, a short.
+  One position per level at a time, and after three losing attempts in a row on
+  a level no new attempt for 26 candles.
+
+The entry and stop of a pullback use the average of the last completed candle,
+and the trade is entered inside the next candle, which is how a touch of the
+average is traded live. A candle that falls through both entry and stop counts
+as a full loss.
+
+The summary reports the two entries separately (`break short`, `pullback long`,
+and so on).
+
 Each trade records RSI and divergence on the break candle. Divergence filters
 nothing; the summary has `short with divergence`, `short without divergence`,
 `long with divergence` and `long without divergence` rows, where "with" means
@@ -175,8 +195,9 @@ Read the results with these limits in mind:
   missing, which flatters long trades and penalizes short trades.
 - Monthly and quarterly levels produce few trades per ticker.
 - Entries assume a fill at the closing price of the break candle.
-- Only the break signal is tested. Proximity alerts, pullback entries,
-  retracement entries and options are not.
+- Retracement entries, Bollinger entries and options are not tested.
+- "A little above" and "a little below" the average are not quantified by JDB;
+  the 1% and 2% defaults are this project's choice.
 
 ## Edit Tickers
 
