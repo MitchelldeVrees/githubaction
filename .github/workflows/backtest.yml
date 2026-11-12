@@ -1,7 +1,8 @@
 name: Backtest
 
 # Runs backtest.py on real price data whenever the backtest code changes on this
-# branch, and uploads each variant's trades and summary as an artifact.
+# branch, uploads each variant's trades and summary as an artifact, and commits
+# all results of the run to the backtest-results branch under runs/.
 
 on:
   push:
@@ -74,3 +75,37 @@ jobs:
           path: results/backtest_${{ matrix.name }}/
           if-no-files-found: warn
           retention-days: 14
+
+  publish:
+    needs: backtest
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Commit results to the backtest-results branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin backtest-results; then
+            git fetch --depth 1 origin backtest-results
+            git checkout -B backtest-results FETCH_HEAD
+          else
+            git checkout --orphan backtest-results
+            git rm -rf --quiet .
+          fi
+          dest="runs/$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          mkdir -p "$dest"
+          cp -r "${{ runner.temp }}/artifacts/." "$dest/"
+          git add runs
+          git commit -m "Backtest results for ${GITHUB_SHA::7}"
+          git push origin backtest-results
