@@ -55,6 +55,8 @@ def scanner_decision(daily: pd.DataFrame, run_date: pd.Timestamp):
             score=analysis.score.iloc[:keep],
             touch_count=analysis.touch_count.iloc[:keep],
             bars_streak=analysis.bars_streak.iloc[:keep],
+            streak_touches=analysis.streak_touches.iloc[:keep],
+            faulty_candles=analysis.faulty_candles.iloc[:keep],
         )
     dominant = scanner.select_dominant_level("TEST", trimmed, as_of_pos=-2)
     if dominant is None:

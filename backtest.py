@@ -64,6 +64,8 @@ class Signal:
     signal_type: str
     position: int  # index of the break candle in the timeframe's candles
     bars_streak: int
+    streak_touches: int
+    faulty_candles: int
     score: float
 
 
@@ -77,6 +79,8 @@ class Trade:
     length: int
     average_type: str
     bars_streak: int
+    streak_touches: int
+    faulty_candles: int
     score: float
     rsi_at_entry: float | None
     negative_divergence: bool | None
@@ -105,6 +109,8 @@ def candidate_arrays(
             "direction": analysis.direction.to_numpy(),
             "score": analysis.score.to_numpy(dtype=float),
             "streak": analysis.bars_streak.to_numpy(),
+            "touches": analysis.streak_touches.to_numpy(),
+            "faults": analysis.faulty_candles.to_numpy(),
         }
         for key, analysis in analyses.items()
     }
@@ -191,6 +197,8 @@ def iter_run_signals(
                     signal_type=signal_type,
                     position=latest,
                     bars_streak=int(data["streak"][previous]),
+                    streak_touches=int(data["touches"][previous]),
+                    faulty_candles=int(data["faults"][previous]),
                     score=float(data["score"][previous]),
                 )
             break  # the first hierarchy step with a dominant level decides
@@ -299,6 +307,8 @@ def simulate_trade(
         length=signal.length,
         average_type=signal.average_type,
         bars_streak=signal.bars_streak,
+        streak_touches=signal.streak_touches,
+        faulty_candles=signal.faulty_candles,
         score=round(signal.score, 2),
         rsi_at_entry=divergence["rsi"],
         negative_divergence=divergence["negative_divergence"],
@@ -510,6 +520,10 @@ def main() -> None:
             "cost_pct_per_side": args.cost_pct,
             "start": args.start,
             "prices": "dividend adjusted" if scanner.YFINANCE_AUTO_ADJUST else "unadjusted",
+            "min_touches": scanner.MIN_TOUCHES,
+            "faulty_candles_allowed": scanner.FAULTY_CANDLES_ALLOWED,
+            "faulty_candle_max_pct": scanner.FAULTY_CANDLE_MAX_PCT,
+            "dominant_lengths": list(scanner.DOMINANT_LENGTHS),
         },
         "tickers": len(tickers),
         "tickers_with_errors": len(errors),

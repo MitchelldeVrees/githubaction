@@ -15,42 +15,49 @@ This is not financial advice.
 
 ## Strategy
 
-The strategy is translated from the supplied Pine Script:
+The dominance rules follow the JDB strategy (component 1, the MA component).
 
-- A bullish/support dominant level requires the close to stay above an MA/EMA for `BULL_BARS_REQUIRED` candles.
-- A bearish/resistance dominant level requires the close to stay below an MA/EMA for `BEAR_BARS_REQUIRED` candles.
-- Bounces/rejections are not required. They only increase the quality score.
-- Support bounce: candle low is within `TOUCH_DISTANCE_PCT` above the MA/EMA and the candle closes above it.
-- Resistance rejection: candle high is within `TOUCH_DISTANCE_PCT` below the MA/EMA and the candle closes below it.
-- Support score: `bars_above_streak + bullish_bounces * BOUNCE_WEIGHT`.
-- Resistance score: `bars_below_streak + bearish_rejections * BOUNCE_WEIGHT`.
+An average is **dominant support** when all of these hold:
 
-The scanner checks:
+- the close has stayed above it for at least `BULL_BARS_REQUIRED` candles;
+- price has touched it at least `MIN_TOUCHES` times during that streak. A touch
+  is a candle whose low comes within `TOUCH_DISTANCE_PCT` of the average and
+  which still closes above it. A long streak far above an average is not
+  support;
+- at most `FAULTY_CANDLES_ALLOWED` (0 or 1) earlier candle closed below it, and
+  only as a close call, within `FAULTY_CANDLE_MAX_PCT` of the average. Such a
+  candle is treated as noise and does not end the streak. A larger miss, or a
+  second one, does.
 
-- 20 SMA
-- 50 SMA
-- 20 EMA
-- 50 EMA
+**Dominant resistance** is the mirror image with `BEAR_BARS_REQUIRED` candles
+below the average. Candles before an average has a full window behind it never
+count.
 
-Across:
+The scanner checks SMA and EMA of the lengths in `DOMINANT_LENGTHS` (20, 50 and
+200) on weekly, biweekly, monthly and quarterly candles. Selection walks the
+timeframes from short to long and, within a timeframe, the lengths from short to
+long: Weekly 20, Weekly 50, Weekly 200, Biweekly 20, and so on. The first step
+with a dominant level decides. Within a step, SMA and EMA are compared by score
+(`streak + touches in the last BOUNCE_LOOKBACK candles * BOUNCE_WEIGHT`).
 
-- Weekly
-- Biweekly
-- Monthly
-- Quarterly
+The numbers behind "several touches" and "a close call" are this project's
+reading of rules JDB states in words:
 
-Dominant level selection follows this hierarchy:
+```text
+BULL_BARS_REQUIRED=70
+BEAR_BARS_REQUIRED=40
+MIN_TOUCHES=2
+FAULTY_CANDLES_ALLOWED=1
+FAULTY_CANDLE_MAX_PCT=2.0
+DOMINANT_LENGTHS=20,50,200
+```
 
-1. Weekly 20
-2. Weekly 50
-3. Biweekly 20
-4. Biweekly 50
-5. Monthly 20
-6. Monthly 50
-7. Quarterly 20
-8. Quarterly 50
+To get the original behavior back, where an uninterrupted streak alone made an
+average dominant, set `MIN_TOUCHES=0`, `FAULTY_CANDLES_ALLOWED=0` and
+`DOMINANT_LENGTHS=20,50`.
 
-Within each hierarchy step, SMA and EMA are compared by score and the better one is selected. Score is not used to skip ahead in the hierarchy.
+Each result also reports `streak_touches` and `faulty_candles` for the dominant
+level.
 
 ## Signal Logic
 

@@ -68,6 +68,23 @@ TOUCH_DISTANCE_PCT = env_float("TOUCH_DISTANCE_PCT", 1.5)
 BOUNCE_LOOKBACK = env_int("BOUNCE_LOOKBACK", 150)
 BOUNCE_WEIGHT = env_int("BOUNCE_WEIGHT", 10)
 
+# What makes an average dominant, following the JDB strategy. Setting
+# MIN_TOUCHES=0, FAULTY_CANDLES_ALLOWED=0 and DOMINANT_LENGTHS=20,50 restores
+# the original behavior, where an uninterrupted streak alone was enough.
+#
+# MIN_TOUCHES: price must have touched or turned at the average this many times
+#   during the streak. A long streak far away from the average is not support.
+# FAULTY_CANDLES_ALLOWED (0 or 1): one earlier close on the wrong side does not
+#   end the streak, provided it was a close call.
+# FAULTY_CANDLE_MAX_PCT: how far beyond the average a close call may be.
+# DOMINANT_LENGTHS: the average lengths that can be dominant.
+MIN_TOUCHES = env_int("MIN_TOUCHES", 2)
+FAULTY_CANDLES_ALLOWED = env_int("FAULTY_CANDLES_ALLOWED", 1)
+FAULTY_CANDLE_MAX_PCT = env_float("FAULTY_CANDLE_MAX_PCT", 2.0)
+DOMINANT_LENGTHS = tuple(
+    int(value) for value in env_str("DOMINANT_LENGTHS", "20,50,200").split(",") if value.strip()
+)
+
 # RSI divergence, reported as context next to each dominant level. A swing is a
 # candle whose high (or low) is the extreme of DIVERGENCE_SWING_BARS candles on
 # each side. The last two swings within DIVERGENCE_LOOKBACK candles are
@@ -109,15 +126,11 @@ TIMEFRAME_RULES: dict[str, str] = {
     "Quarterly": "QE",
 }
 
+# Dominant level selection walks the timeframes from short to long and, within
+# a timeframe, the lengths from short to long. The first step with a dominant
+# level decides.
 HIERARCHY: list[tuple[str, int]] = [
-    ("Weekly", 20),
-    ("Weekly", 50),
-    ("Biweekly", 20),
-    ("Biweekly", 50),
-    ("Monthly", 20),
-    ("Monthly", 50),
-    ("Quarterly", 20),
-    ("Quarterly", 50),
+    (timeframe, length) for timeframe in TIMEFRAME_RULES for length in DOMINANT_LENGTHS
 ]
 
 AVERAGE_TYPES = ("SMA", "EMA")
@@ -140,6 +153,8 @@ RESULT_FIELDS = [
     "score",
     "bounce_count",
     "bars_streak",
+    "streak_touches",
+    "faulty_candles",
     "candle_date",
     "next_target",
     "next_target_value",
@@ -210,6 +225,8 @@ class CandidateAnalysis:
     score: pd.Series
     touch_count: pd.Series
     bars_streak: pd.Series
+    streak_touches: pd.Series
+    faulty_candles: pd.Series
 
 
 @dataclass(frozen=True)
@@ -224,6 +241,8 @@ class DominantSnapshot:
     score: float
     touch_count: int
     bars_streak: int
+    streak_touches: int
+    faulty_candles: int
     latest_close: float
     previous_close: float
     dominant_value_latest: float
@@ -716,21 +735,93 @@ def bars_since_true(condition: pd.Series) -> pd.Series:
     return pd.Series(values, index=condition.index, dtype="int64")
 
 
+def tolerant_streaks(
+    on_side: np.ndarray,
+    close_call: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Count how long price has stayed on one side of an average.
+
+    `on_side` marks candles closing on the dominant side. `close_call` marks
+    candles closing on the wrong side by a small margin. One close call between
+    two runs is treated as noise and joins them; anything else ends the streak.
+    The candle being measured must itself be on the dominant side.
+
+    Returns, per candle: the number of on-side candles in the streak, the number
+    of candles the streak spans (including a tolerated one), and the number of
+    tolerated candles (0 or 1).
+    """
+    count = len(on_side)
+    streak = np.zeros(count, dtype="int64")
+    span = np.zeros(count, dtype="int64")
+    faults = np.zeros(count, dtype="int64")
+    run = 0  # on-side candles since the last wrong-side close
+    carried = 0  # the run before a single tolerated close call
+    for index in range(count):
+        if on_side[index]:
+            run += 1
+            streak[index] = run + carried
+            faults[index] = 1 if carried else 0
+            span[index] = streak[index] + faults[index]
+        else:
+            carried = run if (close_call[index] and run > 0) else 0
+            run = 0
+    return streak, span, faults
+
+
+def touches_within(touches: pd.Series, span: np.ndarray) -> np.ndarray:
+    """Count the touches inside the last `span` candles, for every candle."""
+    running = np.concatenate([[0], np.cumsum(touches.to_numpy(dtype="int64"))])
+    ends = np.arange(1, len(span) + 1)
+    return running[ends] - running[np.maximum(ends - span, 0)]
+
+
 def analyze_candidate(
     ohlc: pd.DataFrame,
     timeframe: str,
     length: int,
     average_type: str,
 ) -> CandidateAnalysis:
-    """Analyze one MA/EMA candidate using the Pine dominance rules."""
+    """Analyze one MA/EMA candidate for dominance.
+
+    An average is dominant support when price has closed above it for at least
+    BULL_BARS_REQUIRED candles and touched it at least MIN_TOUCHES times in that
+    streak; dominant resistance is the mirror image with BEAR_BARS_REQUIRED.
+    With FAULTY_CANDLES_ALLOWED, one earlier close call on the wrong side does
+    not end the streak.
+    """
     close = ohlc["Close"]
     ma = calculate_average(close, length, average_type)
 
-    bars_above_streak = bars_since_true(close <= ma)
-    bars_below_streak = bars_since_true(close >= ma)
-
     bullish_bounce = (ohlc["Low"] <= ma * (1 + TOUCH_DISTANCE_PCT / 100)) & (close > ma)
     bearish_reject = (ohlc["High"] >= ma * (1 - TOUCH_DISTANCE_PCT / 100)) & (close < ma)
+
+    # An average only means something once it has a full window of candles
+    # behind it. An EMA has a value from the first candle on, hugging the price.
+    established = pd.Series(np.arange(len(close)) >= length - 1, index=ohlc.index)
+
+    if FAULTY_CANDLES_ALLOWED > 0:
+        close_call = ((close / ma - 1).abs() <= FAULTY_CANDLE_MAX_PCT / 100).to_numpy()
+        above, above_span, above_faults = tolerant_streaks(
+            ((close > ma) & established).to_numpy(), close_call
+        )
+        below, below_span, below_faults = tolerant_streaks(
+            ((close < ma) & established).to_numpy(), close_call
+        )
+        bars_above_streak = pd.Series(above, index=ohlc.index)
+        bars_below_streak = pd.Series(below, index=ohlc.index)
+    else:
+        bars_above_streak = bars_since_true(close <= ma)
+        bars_below_streak = bars_since_true(close >= ma)
+        above_span = bars_above_streak.to_numpy()
+        below_span = bars_below_streak.to_numpy()
+        above_faults = below_faults = np.zeros(len(close), dtype="int64")
+
+    above_touches = pd.Series(
+        touches_within(bullish_bounce & established, above_span), index=ohlc.index
+    )
+    below_touches = pd.Series(
+        touches_within(bearish_reject & established, below_span), index=ohlc.index
+    )
 
     bull_bounces = bullish_bounce.astype(int).rolling(
         BOUNCE_LOOKBACK, min_periods=1
@@ -739,9 +830,16 @@ def analyze_candidate(
         BOUNCE_LOOKBACK, min_periods=1
     ).sum()
 
-    support_mask = (bars_above_streak >= BULL_BARS_REQUIRED) & ma.notna()
+    support_mask = (
+        (bars_above_streak >= BULL_BARS_REQUIRED)
+        & ma.notna()
+        & (above_touches >= MIN_TOUCHES)
+    )
     resistance_mask = (
-        (bars_below_streak >= BEAR_BARS_REQUIRED) & ma.notna() & ~support_mask
+        (bars_below_streak >= BEAR_BARS_REQUIRED)
+        & ma.notna()
+        & (below_touches >= MIN_TOUCHES)
+        & ~support_mask
     )
 
     direction = pd.Series(0, index=ohlc.index, dtype="int64")
@@ -766,6 +864,14 @@ def analyze_candidate(
     bars_streak.loc[support_mask] = bars_above_streak.loc[support_mask]
     bars_streak.loc[resistance_mask] = bars_below_streak.loc[resistance_mask]
 
+    streak_touches = pd.Series(0, index=ohlc.index, dtype="int64")
+    streak_touches.loc[support_mask] = above_touches.loc[support_mask]
+    streak_touches.loc[resistance_mask] = below_touches.loc[resistance_mask]
+
+    faulty_candles = pd.Series(0, index=ohlc.index, dtype="int64")
+    faulty_candles.loc[support_mask] = above_faults[support_mask.to_numpy()]
+    faulty_candles.loc[resistance_mask] = below_faults[resistance_mask.to_numpy()]
+
     return CandidateAnalysis(
         timeframe=timeframe,
         length=length,
@@ -776,6 +882,8 @@ def analyze_candidate(
         score=score,
         touch_count=touch_count,
         bars_streak=bars_streak,
+        streak_touches=streak_touches,
+        faulty_candles=faulty_candles,
     )
 
 
@@ -833,6 +941,8 @@ def snapshot_candidate(
         score=score,
         touch_count=int(analysis.touch_count.iloc[position]),
         bars_streak=int(analysis.bars_streak.iloc[position]),
+        streak_touches=int(analysis.streak_touches.iloc[position]),
+        faulty_candles=int(analysis.faulty_candles.iloc[position]),
         latest_close=latest_close,
         previous_close=previous_close,
         dominant_value_latest=latest_ma,
@@ -1028,6 +1138,8 @@ def empty_result(
         "score": None,
         "bounce_count": None,
         "bars_streak": None,
+        "streak_touches": None,
+        "faulty_candles": None,
         **empty_context(),
         "message": message,
         "error": error,
@@ -1061,6 +1173,8 @@ def result_from_snapshot(
         "score": clean_number(snapshot.score, decimals=2),
         "bounce_count": snapshot.touch_count,
         "bars_streak": snapshot.bars_streak,
+        "streak_touches": snapshot.streak_touches,
+        "faulty_candles": snapshot.faulty_candles,
         **(context or empty_context()),
         "message": message,
         "error": None,
@@ -1289,6 +1403,8 @@ def build_signal_telegram_section(result: dict[str, Any]) -> str:
             f"Score: {format_price(result['score'])}",
             f"{count_label}: {result['bounce_count']}",
             f"Bars streak: {result['bars_streak']}",
+            f"Touches in streak: {result['streak_touches']}"
+            + (" (one close call ignored)" if result.get("faulty_candles") else ""),
             *context_lines,
         ]
     )
