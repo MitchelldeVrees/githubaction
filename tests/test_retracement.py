@@ -123,3 +123,22 @@ def test_clean_history_keeps_normal_data():
     cleaned, flags = backtest.clean_history(daily, max_jump=4.0)
     assert flags == []
     assert cleaned is daily
+
+
+def test_random_baseline_uses_the_trade_geometry():
+    daily = random_daily(12)
+    trades, _ = backtest.backtest_ticker("TEST", daily, setups=("break", "retracement"))
+    analyses = scanner.build_candidate_analyses(daily)
+    rows = backtest.random_baseline(trades, analyses, per_trade=3, max_candles=104, cost_pct=0.1)
+    assert rows
+    eligible = [t for t in trades if t.exit_reason != "open"]
+    assert len(rows) <= 3 * len(eligible)
+    assert {row["setup"] for row in rows} <= {"break", "retracement"}
+    stops = [row for row in rows if row["exit_reason"] == "stop"]
+    assert stops and all(row["r_multiple"] < -0.99 for row in stops)
+    again = backtest.random_baseline(trades, analyses, per_trade=3, max_candles=104, cost_pct=0.1)
+    assert again == rows  # deterministic
+
+    summary = backtest.baseline_summary(trades, rows)
+    for row in summary.values():
+        assert row["signal_trades"] > 0 and row["random_trades"] > 0

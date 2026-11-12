@@ -37,6 +37,10 @@ jobs:
             auto_adjust: "true"
             cache: adjusted
             args: "--setups pullback --pullback-target none"
+          - name: adjusted_baseline
+            auto_adjust: "true"
+            cache: adjusted
+            args: "--setups break,retracement --baseline 5"
 
     steps:
       - name: Check out repository

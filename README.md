@@ -202,6 +202,13 @@ close more than `--max-daily-jump` (default 4) times the previous close, or less
 than a quarter of it. Only the data after the last such jump is used, and every
 jump is listed in `data_flags.csv`.
 
+`--baseline N` adds a control: for every closed break and retracement trade, N
+trades in the same ticker, timeframe and direction at random dates, with the
+stop and target at the same percentage distance. They are written to
+`baseline_trades.csv` and compared with the real trades in the summary. Because
+the control trades come from the same stocks, it separates the signal's effect
+from the drift of the stock universe, including the survivor effect.
+
 Each trade records RSI and divergence on the break candle. Divergence filters
 nothing; the summary has `short with divergence`, `short without divergence`,
 `long with divergence` and `long without divergence` rows, where "with" means

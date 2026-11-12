@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -794,6 +795,116 @@ def simulate_retracement(
     return trades
 
 
+def random_baseline(
+    trades: list[Trade],
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    per_trade: int,
+    max_candles: int,
+    cost_pct: float,
+) -> list[dict[str, Any]]:
+    """Trade the same geometry as each signal at random dates, as a control.
+
+    For every closed break and retracement trade, `per_trade` trades are made in
+    the same ticker, timeframe and direction, entered at the close of a random
+    candle, with the stop and target at the same percentage distance from the
+    entry as the real trade had. Stop and target stay fixed. If the signal adds
+    nothing, the real trades and these random ones should score about the same,
+    whatever the stock universe's own drift is.
+    """
+    rows: list[dict[str, Any]] = []
+    for trade in trades:
+        if trade.setup not in ("break", "retracement") or trade.exit_reason == "open":
+            continue
+        if trade.stop_at_entry is None or trade.target_at_entry is None:
+            continue
+        ohlc = analyses[(trade.timeframe, trade.length, trade.average_type)].ohlc
+        open_, high, low, close = (
+            ohlc[column].to_numpy(dtype=float) for column in ("Open", "High", "Low", "Close")
+        )
+        if len(close) < 260:
+            continue
+        short = trade.side == "short"
+        sign = -1.0 if short else 1.0
+        stop_ratio = trade.stop_at_entry / trade.entry_price
+        target_ratio = trade.target_at_entry / trade.entry_price
+        seed = zlib.crc32(f"{trade.ticker}|{trade.setup}|{trade.entry_date}".encode())
+        rng = np.random.default_rng(seed)
+        for position in rng.integers(200, len(close) - 1, size=per_trade):
+            entry = close[position]
+            stop, target = entry * stop_ratio, entry * target_ratio
+            risk = abs(entry - stop)
+            if risk <= 0:
+                continue
+            exit_price, reason = None, None
+            for k in range(position + 1, len(close)):
+                if high[k] >= stop if short else low[k] <= stop:
+                    gapped = open_[k] >= stop if short else open_[k] <= stop
+                    exit_price, reason = (open_[k] if gapped else stop), "stop"
+                    break
+                if low[k] <= target if short else high[k] >= target:
+                    gapped = open_[k] <= target if short else open_[k] >= target
+                    exit_price, reason = (open_[k] if gapped else target), "target"
+                    break
+                if k - position >= max_candles:
+                    exit_price, reason = close[k], "time"
+                    break
+            if exit_price is None:
+                continue  # still open at the end of the data
+            rows.append(
+                {
+                    "setup": trade.setup,
+                    "side": trade.side,
+                    "timeframe": trade.timeframe,
+                    "length": trade.length,
+                    "ticker": trade.ticker,
+                    "entry_date": pd.Timestamp(ohlc.index[position]).date().isoformat(),
+                    "exit_reason": reason,
+                    "return_pct": round(
+                        float(sign * (exit_price / entry - 1) * 100 - 2 * cost_pct), 3
+                    ),
+                    "r_multiple": round(
+                        float(sign * (exit_price - entry) / risk - 2 * cost_pct / 100 * entry / risk),
+                        3,
+                    ),
+                }
+            )
+    return rows
+
+
+def baseline_summary(
+    trades: list[Trade],
+    baseline: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Compare real break and retracement trades with their random-date controls."""
+    result: dict[str, dict[str, Any]] = {}
+    for setup in ("break", "retracement"):
+        for side in ("long", "short"):
+            real = [
+                trade.r_multiple
+                for trade in trades
+                if trade.setup == setup
+                and trade.side == side
+                and trade.exit_reason != "open"
+                and trade.r_multiple is not None
+            ]
+            control = [
+                row["r_multiple"]
+                for row in baseline
+                if row["setup"] == setup and row["side"] == side
+            ]
+            if not real or not control:
+                continue
+            result[f"{setup} {side}"] = {
+                "signal_trades": len(real),
+                "signal_avg_r": round(float(np.mean(real)), 3),
+                "signal_win_rate_pct": round(float(np.mean(np.array(real) > 0) * 100), 1),
+                "random_trades": len(control),
+                "random_avg_r": round(float(np.mean(control)), 3),
+                "random_win_rate_pct": round(float(np.mean(np.array(control) > 0) * 100), 1),
+            }
+    return result
+
+
 def backtest_ticker(
     ticker: str,
     daily: pd.DataFrame,
@@ -1005,6 +1116,12 @@ def parse_args() -> argparse.Namespace:
         help="maximum retracement shorts per break",
     )
     parser.add_argument(
+        "--baseline",
+        type=int,
+        default=0,
+        help="random-date control trades per break and retracement trade (0: off)",
+    )
+    parser.add_argument(
         "--max-daily-jump",
         type=float,
         default=4.0,
@@ -1042,6 +1159,7 @@ def main() -> None:
     trades: list[Trade] = []
     skipped = 0
     data_flags: list[dict[str, Any]] = []
+    baseline: list[dict[str, Any]] = []
     for ticker in tickers:
         daily = price_data.get(ticker)
         if daily is None:
@@ -1073,6 +1191,16 @@ def main() -> None:
             continue
         trades.extend(ticker_trades)
         skipped += ticker_skipped
+        if args.baseline > 0:
+            baseline.extend(
+                random_baseline(
+                    ticker_trades,
+                    scanner.build_candidate_analyses(daily),
+                    args.baseline,
+                    args.max_candles,
+                    args.cost_pct,
+                )
+            )
 
     summary = {
         "settings": {
@@ -1101,6 +1229,8 @@ def main() -> None:
         "breaks_without_target": skipped,
         "groups": grouped_summary(trades),
     }
+    if args.baseline > 0:
+        summary["random_baseline"] = baseline_summary(trades, baseline)
     write_outputs(trades, summary, args.out)
     with (args.out / "data_flags.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
@@ -1108,6 +1238,17 @@ def main() -> None:
         )
         writer.writeheader()
         writer.writerows(data_flags)
+    if baseline:
+        with (args.out / "baseline_trades.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(baseline[0]))
+            writer.writeheader()
+            writer.writerows(baseline)
+        print("\nSignal against random dates with the same stop and target distances:")
+        for name, row in summary["random_baseline"].items():
+            print(
+                f"{name:<20} signal {row['signal_avg_r']:+.3f} R ({row['signal_trades']}), "
+                f"random {row['random_avg_r']:+.3f} R ({row['random_trades']})"
+            )
     if errors:
         with (args.out / "errors.json").open("w", encoding="utf-8") as handle:
             json.dump(errors, handle, indent=2)
