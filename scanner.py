@@ -130,9 +130,27 @@ RESULT_FIELDS = [
     "score",
     "bounce_count",
     "bars_streak",
+    "candle_date",
+    "next_target",
+    "next_target_value",
+    "next_target_distance_pct",
+    "ma200_value",
+    "ma200_distance_pct",
     "message",
     "error",
 ]
+
+# Extra context reported next to each dominant level. These fields describe the
+# chart around a signal; they never influence which signals are raised.
+CONTEXT_FIELDS = [
+    "candle_date",
+    "next_target",
+    "next_target_value",
+    "next_target_distance_pct",
+    "ma200_value",
+    "ma200_distance_pct",
+]
+TARGET_LENGTHS = (20, 50, 200)
 
 # Yahoo Finance uses these suffixes for its most common international listings.
 # An unsuffixed symbol is normally a US listing, but an explicit mapping in
@@ -828,6 +846,78 @@ def clean_number(value: float | int | None, decimals: int = 4) -> float | int | 
     return round(number, decimals)
 
 
+def empty_context() -> dict[str, Any]:
+    """Return the context fields with no values."""
+    return {field: None for field in CONTEXT_FIELDS}
+
+
+def distance_pct(level: float | None, close: float | None) -> float | None:
+    """Return how far a level is from the close, as a percentage of the close."""
+    if level is None or close is None or close == 0:
+        return None
+    return (level - close) / close * 100
+
+
+def build_context(
+    snapshot: DominantSnapshot,
+    analyses: dict[tuple[str, int, str], CandidateAnalysis],
+    signal_type: str | None,
+) -> dict[str, Any]:
+    """Describe the chart around a dominant level without changing any signal.
+
+    Reports the end date of the candle the result is based on, the 200-period
+    average on the dominant timeframe, and, for a break, the next longer
+    average (20 -> 50 -> 200) that still lies in the direction of the break.
+    All averages use the dominant level's own timeframe and SMA/EMA type. An
+    average is only reported when the timeframe has at least that many candles.
+    """
+    context = empty_context()
+    analysis = analyses.get((snapshot.timeframe, snapshot.length, snapshot.average_type))
+    if analysis is None or analysis.ohlc.empty:
+        return context
+
+    close = analysis.ohlc["Close"]
+    latest_close = snapshot.latest_close
+    context["candle_date"] = pd.Timestamp(analysis.ohlc.index[-1]).date().isoformat()
+
+    def level(length: int) -> float | None:
+        if len(close) < length:
+            return None
+        return finite_float(
+            calculate_average(close, length, snapshot.average_type).iloc[-1]
+        )
+
+    ma200 = level(200)
+    context["ma200_value"] = clean_number(ma200)
+    context["ma200_distance_pct"] = clean_number(
+        distance_pct(ma200, latest_close), decimals=2
+    )
+
+    if signal_type == "break_below_dominant_support":
+        in_break_direction = lambda value: value < latest_close  # noqa: E731
+    elif signal_type == "break_above_dominant_resistance":
+        in_break_direction = lambda value: value > latest_close  # noqa: E731
+    else:
+        return context
+
+    for length in TARGET_LENGTHS:
+        if length <= snapshot.length:
+            continue
+        value = level(length)
+        if value is None or not in_break_direction(value):
+            continue
+        context["next_target"] = (
+            f"{snapshot.timeframe} {length}{snapshot.average_type}"
+        )
+        context["next_target_value"] = clean_number(value)
+        context["next_target_distance_pct"] = clean_number(
+            distance_pct(value, latest_close), decimals=2
+        )
+        break
+
+    return context
+
+
 def empty_result(
     ticker: str,
     status: str,
@@ -854,6 +944,7 @@ def empty_result(
         "score": None,
         "bounce_count": None,
         "bars_streak": None,
+        **empty_context(),
         "message": message,
         "error": error,
     }
@@ -865,6 +956,7 @@ def result_from_snapshot(
     signal_type: str | None,
     message: str,
     identifiers: dict[str, dict[str, str]] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a result row from a dominant candidate snapshot."""
     identity = security_identity(snapshot.ticker, identifiers)
@@ -885,6 +977,7 @@ def result_from_snapshot(
         "score": clean_number(snapshot.score, decimals=2),
         "bounce_count": snapshot.touch_count,
         "bars_streak": snapshot.bars_streak,
+        **(context or empty_context()),
         "message": message,
         "error": None,
     }
@@ -962,6 +1055,7 @@ def scan_ticker(
                     signal_type=signal_type,
                     message=message,
                     identifiers=identifiers,
+                    context=build_context(previous_dominant, analyses, signal_type),
                 )
 
         current_dominant = select_dominant_level(ticker, analyses, as_of_pos=-1)
@@ -979,6 +1073,7 @@ def scan_ticker(
                     signal_type=signal_type,
                     message=message,
                     identifiers=identifiers,
+                    context=build_context(current_dominant, analyses, signal_type),
                 )
 
             message = (
@@ -993,6 +1088,7 @@ def scan_ticker(
                 signal_type=None,
                 message=message,
                 identifiers=identifiers,
+                context=build_context(current_dominant, analyses, None),
             )
 
         return empty_result(
@@ -1050,6 +1146,12 @@ def format_price(value: Any) -> str:
     return "n/a" if number is None else f"{number:g}"
 
 
+def format_pct(value: Any) -> str:
+    """Format a signed percentage for console or Telegram output."""
+    number = clean_number(value, decimals=2)
+    return "n/a" if number is None else f"{number:+.1f}%"
+
+
 def build_signal_telegram_section(result: dict[str, Any]) -> str:
     """Build one ticker section for a Telegram alert."""
     count_label = (
@@ -1057,6 +1159,28 @@ def build_signal_telegram_section(result: dict[str, Any]) -> str:
         if result["dominant_direction"] == "support"
         else "Rejections"
     )
+    context_lines: list[str] = []
+    if result.get("candle_date"):
+        context_lines.append(f"Candle end: {result['candle_date']}")
+    if result.get("next_target"):
+        context_lines.append(
+            f"Next MA: {result['next_target']} "
+            f"{format_price(result['next_target_value'])} "
+            f"({format_pct(result['next_target_distance_pct'])})"
+        )
+    elif str(result.get("signal_type") or "").startswith("break_"):
+        context_lines.append("Next MA: none in the break direction")
+    ma200_label = (
+        f"{result['dominant_timeframe']} 200{result['dominant_average_type']}"
+    )
+    if result.get("ma200_value") is None:
+        context_lines.append("MA200: n/a (fewer than 200 candles)")
+    elif result.get("next_target") != ma200_label:
+        context_lines.append(
+            f"MA200: {format_price(result['ma200_value'])} "
+            f"({format_pct(result['ma200_distance_pct'])})"
+        )
+
     return "\n".join(
         [
             str(result["ticker"]),
@@ -1071,6 +1195,7 @@ def build_signal_telegram_section(result: dict[str, Any]) -> str:
             f"Score: {format_price(result['score'])}",
             f"{count_label}: {result['bounce_count']}",
             f"Bars streak: {result['bars_streak']}",
+            *context_lines,
         ]
     )
 

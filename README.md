@@ -83,6 +83,24 @@ alert takes precedence over a proximity alert.
 
 The scanner uses only completed higher-timeframe candles. If the current weekly, biweekly, monthly, or quarterly candle is still open, it is excluded.
 
+## Alert Context
+
+Every result row and Telegram alert also carries context about the chart. These
+fields are informational and never change which signals are raised:
+
+- `candle_date`: end date of the completed candle the result is based on. A
+  biweekly, monthly, or quarterly alert can refer to a candle that closed before
+  the latest Friday.
+- `ma200_value`, `ma200_distance_pct`: the 200-period average on the dominant
+  timeframe, in the dominant level's SMA/EMA type, and its distance from the
+  latest close.
+- `next_target`, `next_target_value`, `next_target_distance_pct`: for a break
+  only, the next longer average (20 -> 50 -> 200) that still lies in the
+  direction of the break. Averages the close has already passed are skipped.
+
+An average is reported only when the timeframe has at least that many completed
+candles, so the 200-period average is empty for short histories.
+
 ## Data
 
 The first version uses `yfinance` because it is free and simple to run in GitHub Actions. By default, `scanner.py` sets `YFINANCE_AUTO_ADJUST=true`, so Yahoo Finance returns adjusted OHLC values that account for splits and dividends. Set `YFINANCE_AUTO_ADJUST=false` if you want raw Yahoo OHLC data instead.
