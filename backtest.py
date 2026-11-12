@@ -18,6 +18,10 @@ Trade rules (JDB component 1, break of the dominant average):
 - A trade still open after --max-candles candles exits at that candle's close.
   A trade still open at the end of the data is reported as open.
 
+Each trade also records RSI and RSI divergence on the break candle, as defined
+in scanner.find_divergence. Divergence does not filter any trade; the summary
+compares trades with and without divergence in the trade's direction.
+
 Everything is decided on completed candles and each exit level is known before
 the candle it is tested on. When a candle touches both stop and target, the
 stop is assumed to have come first.
@@ -71,6 +75,9 @@ class Trade:
     average_type: str
     bars_streak: int
     score: float
+    rsi_at_entry: float | None
+    negative_divergence: bool | None
+    positive_divergence: bool | None
     entry_date: str
     entry_price: float
     target: str
@@ -269,6 +276,8 @@ def simulate_trade(
     if risk:
         r_multiple = sign * (exit_price - entry) / risk - 2 * cost_pct / 100 * entry / risk
 
+    divergence = scanner.divergence_context(ohlc, entry_at)
+
     return Trade(
         ticker=signal.ticker,
         side="short" if short else "long",
@@ -277,6 +286,9 @@ def simulate_trade(
         average_type=signal.average_type,
         bars_streak=signal.bars_streak,
         score=round(signal.score, 2),
+        rsi_at_entry=divergence["rsi"],
+        negative_divergence=divergence["negative_divergence"],
+        positive_divergence=divergence["positive_divergence"],
         entry_date=pd.Timestamp(dates[entry_at]).date().isoformat(),
         entry_price=round(float(entry), 4),
         target=f"{signal.timeframe} {target_length}{signal.average_type}",
@@ -360,14 +372,28 @@ def summarize(trades: list[Trade]) -> dict[str, Any]:
     }
 
 
+def confirming_divergence(trade: Trade) -> bool | None:
+    """Divergence in the trade's direction: negative for shorts, positive for longs."""
+    return trade.negative_divergence if trade.side == "short" else trade.positive_divergence
+
+
 def grouped_summary(trades: list[Trade]) -> dict[str, dict[str, Any]]:
-    """Summaries overall, per side, and per side and dominant level."""
+    """Summaries overall, per side, per divergence, and per dominant level."""
     groups: dict[str, list[Trade]] = {"all": trades}
     for trade in trades:
         groups.setdefault(trade.side, []).append(trade)
+        confirmed = confirming_divergence(trade)
+        if confirmed is not None:
+            label = "with" if confirmed else "without"
+            groups.setdefault(f"{trade.side} {label} divergence", []).append(trade)
         level = f"{trade.side} / {trade.timeframe} {trade.length}"
         groups.setdefault(level, []).append(trade)
-    ordered = ["all"] + sorted(key for key in groups if key != "all")
+
+    def order(name: str) -> tuple[str, int, str]:
+        rank = 2 if " / " in name else 1 if name.endswith("divergence") else 0
+        return (name.split(" ")[0], rank, name)
+
+    ordered = ["all"] + sorted((key for key in groups if key != "all"), key=order)
     return {key: summarize(groups[key]) for key in ordered}
 
 

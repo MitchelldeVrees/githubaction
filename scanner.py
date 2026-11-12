@@ -68,6 +68,16 @@ TOUCH_DISTANCE_PCT = env_float("TOUCH_DISTANCE_PCT", 1.5)
 BOUNCE_LOOKBACK = env_int("BOUNCE_LOOKBACK", 150)
 BOUNCE_WEIGHT = env_int("BOUNCE_WEIGHT", 10)
 
+# RSI divergence, reported as context next to each dominant level. A swing is a
+# candle whose high (or low) is the extreme of DIVERGENCE_SWING_BARS candles on
+# each side. The last two swings within DIVERGENCE_LOOKBACK candles are
+# compared, and the most recent one must be at most DIVERGENCE_MAX_AGE candles
+# old.
+RSI_LENGTH = env_int("RSI_LENGTH", 14)
+DIVERGENCE_SWING_BARS = env_int("DIVERGENCE_SWING_BARS", 5)
+DIVERGENCE_LOOKBACK = env_int("DIVERGENCE_LOOKBACK", 100)
+DIVERGENCE_MAX_AGE = env_int("DIVERGENCE_MAX_AGE", 26)
+
 SEND_NO_SIGNAL_MESSAGE = env_bool("SEND_NO_SIGNAL_MESSAGE", True)
 TICKERS_FILE = env_path("TICKERS_FILE", "tickers.txt")
 RESULTS_DIR = env_path("RESULTS_DIR", "results")
@@ -136,6 +146,9 @@ RESULT_FIELDS = [
     "next_target_distance_pct",
     "ma200_value",
     "ma200_distance_pct",
+    "rsi",
+    "negative_divergence",
+    "positive_divergence",
     "message",
     "error",
 ]
@@ -149,6 +162,9 @@ CONTEXT_FIELDS = [
     "next_target_distance_pct",
     "ma200_value",
     "ma200_distance_pct",
+    "rsi",
+    "negative_divergence",
+    "positive_divergence",
 ]
 TARGET_LENGTHS = (20, 50, 200)
 
@@ -617,6 +633,72 @@ def calculate_average(close: pd.Series, length: int, average_type: str) -> pd.Se
     raise ValueError(f"Unsupported average type: {average_type}")
 
 
+def calculate_rsi(close: pd.Series, length: int = RSI_LENGTH) -> pd.Series:
+    """Calculate Wilder's RSI. Each value only depends on earlier closes."""
+    change = close.diff()
+    gain = change.clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    loss = (-change.clip(upper=0)).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    rsi = 100 - 100 / (1 + gain / loss)
+    rsi = rsi.where(loss != 0, 100.0).where((gain != 0) | (loss != 0), 50.0)
+    return rsi.where(gain.notna())
+
+
+def find_divergence(
+    price: np.ndarray,
+    rsi: np.ndarray,
+    position: int,
+    kind: str,
+) -> bool | None:
+    """Detect RSI divergence in the candles before `position`.
+
+    kind "negative": the latest swing high in `price` (candle highs) is higher
+    than the previous swing high while RSI at that candle is lower.
+    kind "positive": the latest swing low in `price` (candle lows) is lower than
+    the previous swing low while RSI at that candle is higher.
+
+    Only candles before `position` can be swings and only data up to `position`
+    is read, so the answer for a candle never changes when later data arrives.
+    Returns None when RSI is not available yet at `position`.
+    """
+    if position < 0 or position >= len(price) or not np.isfinite(rsi[position]):
+        return None
+
+    values = price if kind == "negative" else -price
+    swing = DIVERGENCE_SWING_BARS
+    first = max(swing, position - DIVERGENCE_LOOKBACK + 1)
+    swings: list[int] = []
+    for index in range(first, position):
+        if not np.isfinite(rsi[index]):
+            continue
+        left = index - swing
+        window = values[left : min(position, index + swing) + 1]
+        if left + int(np.argmax(window)) == index:
+            swings.append(index)
+
+    if len(swings) < 2:
+        return False
+    previous, latest = swings[-2], swings[-1]
+    if position - latest > DIVERGENCE_MAX_AGE:
+        return False
+    if kind == "negative":
+        return bool(price[latest] > price[previous] and rsi[latest] < rsi[previous])
+    return bool(price[latest] < price[previous] and rsi[latest] > rsi[previous])
+
+
+def divergence_context(ohlc: pd.DataFrame, position: int) -> dict[str, Any]:
+    """Return RSI and both divergence flags for one candle of a timeframe."""
+    rsi = calculate_rsi(ohlc["Close"]).to_numpy(dtype=float)
+    return {
+        "rsi": clean_number(rsi[position], decimals=1),
+        "negative_divergence": find_divergence(
+            ohlc["High"].to_numpy(dtype=float), rsi, position, "negative"
+        ),
+        "positive_divergence": find_divergence(
+            ohlc["Low"].to_numpy(dtype=float), rsi, position, "positive"
+        ),
+    }
+
+
 def bars_since_true(condition: pd.Series) -> pd.Series:
     """Mirror Pine Script ta.barssince behavior for latest-bar streak checks."""
     values: list[int] = []
@@ -866,10 +948,11 @@ def build_context(
     """Describe the chart around a dominant level without changing any signal.
 
     Reports the end date of the candle the result is based on, the 200-period
-    average on the dominant timeframe, and, for a break, the next longer
-    average (20 -> 50 -> 200) that still lies in the direction of the break.
-    All averages use the dominant level's own timeframe and SMA/EMA type. An
-    average is only reported when the timeframe has at least that many candles.
+    average on the dominant timeframe, RSI with its divergence flags, and, for a
+    break, the next longer average (20 -> 50 -> 200) that still lies in the
+    direction of the break. All of it is measured on the dominant level's own
+    timeframe, and the averages use its SMA/EMA type. An average is only
+    reported when the timeframe has at least that many candles.
     """
     context = empty_context()
     analysis = analyses.get((snapshot.timeframe, snapshot.length, snapshot.average_type))
@@ -879,6 +962,7 @@ def build_context(
     close = analysis.ohlc["Close"]
     latest_close = snapshot.latest_close
     context["candle_date"] = pd.Timestamp(analysis.ohlc.index[-1]).date().isoformat()
+    context.update(divergence_context(analysis.ohlc, len(analysis.ohlc) - 1))
 
     def level(length: int) -> float | None:
         if len(close) < length:
@@ -1179,6 +1263,16 @@ def build_signal_telegram_section(result: dict[str, Any]) -> str:
         context_lines.append(
             f"MA200: {format_price(result['ma200_value'])} "
             f"({format_pct(result['ma200_distance_pct'])})"
+        )
+
+    # Negative divergence matters under a support level, positive divergence
+    # above a resistance level.
+    kind = "negative" if result["dominant_direction"] == "support" else "positive"
+    flag = result.get(f"{kind}_divergence")
+    if flag is not None:
+        context_lines.append(
+            f"{kind.capitalize()} divergence: {'yes' if flag else 'no'} "
+            f"(RSI {format_price(result.get('rsi'))})"
         )
 
     return "\n".join(

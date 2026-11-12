@@ -98,8 +98,27 @@ fields are informational and never change which signals are raised:
   only, the next longer average (20 -> 50 -> 200) that still lies in the
   direction of the break. Averages the close has already passed are skipped.
 
+- `rsi`, `negative_divergence`, `positive_divergence`: RSI on the dominant
+  timeframe and whether it diverges from price. Negative divergence: the latest
+  swing high is higher than the previous one while RSI is lower. Positive
+  divergence: the latest swing low is lower while RSI is higher. A Telegram
+  alert shows the one that matters for its level: negative under a support
+  level, positive above a resistance level.
+
 An average is reported only when the timeframe has at least that many completed
 candles, so the 200-period average is empty for short histories.
+
+Divergence is an approximation of what a trader draws by eye. A swing is a
+candle whose high or low is the extreme of `DIVERGENCE_SWING_BARS` candles on
+each side; the last two swings within `DIVERGENCE_LOOKBACK` candles are
+compared; the latest must be at most `DIVERGENCE_MAX_AGE` candles old.
+
+```text
+RSI_LENGTH=14
+DIVERGENCE_SWING_BARS=5
+DIVERGENCE_LOOKBACK=100
+DIVERGENCE_MAX_AGE=26
+```
 
 ## Data
 
@@ -127,6 +146,11 @@ Rules: entry at the close of the break candle (short below support, long above
 resistance); target is the next longer average (20 -> 50 -> 200) on the same
 timeframe that lies in the break direction; a trade open after `--max-candles`
 candles (default 104) exits at the close. Costs default to 0.1% per side.
+
+Each trade records RSI and divergence on the break candle. Divergence filters
+nothing; the summary has `short with divergence`, `short without divergence`,
+`long with divergence` and `long without divergence` rows, where "with" means
+negative divergence for a short and positive divergence for a long.
 
 Output goes to `results/backtest/`: `backtest_trades.csv` with every trade and
 `backtest_summary.json` with win rate, average win and loss, expectancy, average
