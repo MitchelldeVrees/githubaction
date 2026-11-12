@@ -1,0 +1,76 @@
+name: Backtest
+
+# Runs backtest.py on real price data whenever the backtest code changes on this
+# branch, and uploads each variant's trades and summary as an artifact.
+
+on:
+  push:
+    branches: [jdb-dominance]
+    paths:
+      - backtest.py
+      - scanner.py
+      - .github/workflows/backtest.yml
+  workflow_dispatch:
+
+concurrency:
+  group: backtest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: adjusted
+            auto_adjust: "true"
+          - name: raw
+            auto_adjust: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore Yahoo price cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/yfinance
+          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.name }}-${{ github.run_id }}
+          restore-keys: |
+            yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.name }}-
+            yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-
+            yfinance-price-cache-${{ runner.os }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Run backtest
+        env:
+          YFINANCE_AUTO_ADJUST: ${{ matrix.auto_adjust }}
+          YFINANCE_BATCH_SIZE: "25"
+          YFINANCE_BATCH_DELAY_SECONDS: "5"
+        run: python backtest.py --out results/backtest_${{ matrix.name }}
+
+      - name: Save Yahoo price cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/yfinance
+          key: yfinance-price-cache-${{ runner.os }}-${{ hashFiles('tickers.txt') }}-${{ matrix.name }}-${{ github.run_id }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ matrix.name }}
+          path: results/backtest_${{ matrix.name }}/
+          if-no-files-found: warn
+          retention-days: 14
