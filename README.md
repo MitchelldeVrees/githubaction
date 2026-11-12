@@ -109,6 +109,38 @@ Free Yahoo Finance data can be delayed, revised, rate limited, or temporarily un
 
 For larger ticker lists, the scanner downloads Yahoo data in batches, retries failed batches with backoff, waits briefly between batches, and stores daily OHLCV data in `.cache/yfinance`. GitHub Actions restores and saves that cache between runs, so after the first full-history scan, normal weekly runs only request recent incremental data for cached tickers.
 
+## Backtest
+
+`backtest.py` replays the scanner over the full price history and simulates one
+trade per break it would have alerted on. It imports the scanner's own candle
+building and dominance analysis, so it tests the same signals the Friday run
+raises.
+
+```bash
+python backtest.py                      # stop beyond the break candle
+python backtest.py --stop reclaim       # stop on a close back across the average
+python backtest.py --start 2010-01-01   # ignore older signals
+YFINANCE_AUTO_ADJUST=false python backtest.py   # unadjusted prices
+```
+
+Rules: entry at the close of the break candle (short below support, long above
+resistance); target is the next longer average (20 -> 50 -> 200) on the same
+timeframe that lies in the break direction; a trade open after `--max-candles`
+candles (default 104) exits at the close. Costs default to 0.1% per side.
+
+Output goes to `results/backtest/`: `backtest_trades.csv` with every trade and
+`backtest_summary.json` with win rate, average win and loss, expectancy, average
+R, holding time and the longest losing streak, overall and per dominant level.
+
+Read the results with these limits in mind:
+
+- `tickers.txt` holds companies that exist today. Companies that failed are
+  missing, which flatters long trades and penalizes short trades.
+- Monthly and quarterly levels produce few trades per ticker.
+- Entries assume a fill at the closing price of the break candle.
+- Only the break signal is tested. Proximity alerts, pullback entries,
+  retracement entries and options are not.
+
 ## Edit Tickers
 
 Edit `tickers.txt` and put one Yahoo Finance ticker per line:
