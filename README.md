@@ -164,13 +164,17 @@ Two entries are simulated, chosen with `--setups` (default `break,pullback`):
 
 - `break`: the close through the dominant average described above.
 - `pullback`: while an average is dominant, price coming back to it. For
-  dominant support this is a long: entry `--pullback-entry-pct` (default 1%)
-  above the average, stop `--pullback-stop-pct` (default 2%) below it. The stop
-  follows the average and only tightens. The target is the nearest other average
-  above the entry; when price is above all of them there is no target and the
-  trailed stop ends the trade. Dominant resistance is the mirror image, a short.
-  One position per level at a time, and after three losing attempts in a row on
-  a level no new attempt for 26 candles.
+  dominant support this is a long: entry `--pullback-entry-atr` (default 0.25)
+  ATR above the average, stop `--pullback-stop-atr` (default 0.75) ATR below
+  it. ATR is the 14-candle average true range of the signal's own timeframe, so
+  a monthly stop sits further from the average than a weekly one and a volatile
+  stock gets more room than a quiet one. The stop follows the average and only
+  tightens. The target is the nearest other average above the entry; when price
+  is above all of them there is no target and the trailed stop ends the trade.
+  Dominant resistance is the mirror image, a short. One position per idea at a
+  time, where the SMA and EMA of the same timeframe and length are one idea;
+  after three losing attempts in a row on an idea, no new attempt for 26
+  candles.
 
 The entry and stop of a pullback use the average of the last completed candle,
 and the trade is entered inside the next candle, which is how a touch of the
@@ -197,7 +201,7 @@ Read the results with these limits in mind:
 - Entries assume a fill at the closing price of the break candle.
 - Retracement entries, Bollinger entries and options are not tested.
 - "A little above" and "a little below" the average are not quantified by JDB;
-  the 1% and 2% defaults are this project's choice.
+  the 0.25 and 0.75 ATR defaults are this project's choice.
 
 ## Edit Tickers
 

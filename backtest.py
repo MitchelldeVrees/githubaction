@@ -52,6 +52,7 @@ import pandas as pd
 import scanner
 
 TARGET_LENGTHS = (20, 50, 200)
+ATR_LENGTH = 14
 SUPPORT = 1
 RESISTANCE = -1
 
@@ -292,30 +293,47 @@ def iter_dominant_levels(
             break  # the first hierarchy step with a dominant level decides
 
 
+def calculate_atr(ohlc: pd.DataFrame, length: int = ATR_LENGTH) -> np.ndarray:
+    """Wilder's average true range. Each value only depends on earlier candles."""
+    high, low, close = (ohlc[column] for column in ("High", "Low", "Close"))
+    previous = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - previous).abs(), (low - previous).abs()], axis=1
+    ).max(axis=1)
+    return (
+        true_range.ewm(alpha=1 / length, adjust=False, min_periods=length)
+        .mean()
+        .to_numpy(dtype=float)
+    )
+
+
 def simulate_pullback(
     setup: Setup,
     analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
-    entry_pct: float,
-    stop_pct: float,
+    entry_atr: float,
+    stop_atr: float,
     max_candles: int,
     cost_pct: float,
 ) -> Trade | None:
     """Simulate a pullback to the dominant average in the candle after `setup`.
 
-    Long at dominant support (short at dominant resistance is the mirror image):
+    Long at dominant support (short at dominant resistance is the mirror image).
+    Distances are in units of the average true range (ATR) of the signal's own
+    timeframe, so a monthly stop sits further from the average than a weekly
+    one, and a volatile stock gets more room than a quiet one:
 
-    - Entry when the next candle trades down to `entry_pct` above the average.
-      A candle that opens below that level is entered at its open, unless it
-      opens beyond the stop.
-    - Stop `stop_pct` below the average. It follows the average from candle to
-      candle and only ever tightens.
+    - Entry when the next candle trades down to `entry_atr` ATR above the
+      average. A candle that opens below that level is entered at its open,
+      unless it opens beyond the stop.
+    - Stop `stop_atr` ATR below the average. It follows the average from candle
+      to candle and only ever tightens.
     - Target is the nearest other average (20, 50 or 200, same SMA/EMA type)
       above the entry. With no average above, there is no target and the stop
       alone ends the trade.
 
     The average of the last completed candle is used for the entry and stop of
     the candle being traded. Returns None when the candle never reaches the
-    entry level.
+    entry level, or when the ATR is not known yet.
     """
     analysis = analyses[(setup.timeframe, setup.length, setup.average_type)]
     ohlc = analysis.ohlc
@@ -329,15 +347,18 @@ def simulate_pullback(
         ohlc[column].to_numpy(dtype=float) for column in ("Open", "High", "Low", "Close")
     )
     dominant = analysis.ma.to_numpy(dtype=float)
+    atr = calculate_atr(ohlc)
+    if not np.isfinite(atr[known]):
+        return None
     long = setup.direction == SUPPORT
     sign = 1.0 if long else -1.0
 
-    def beyond(level: float, pct: float) -> float:
-        """Move a level `pct` percent in the trade's direction (negative: against)."""
-        return level * (1 + sign * pct / 100)
+    def beyond(index: int, units: float) -> float:
+        """The average of candle `index` moved `units` ATR in the trade's direction."""
+        return dominant[index] + sign * units * atr[index]
 
-    entry_level = beyond(dominant[known], entry_pct)
-    stop = initial_stop = beyond(dominant[known], -stop_pct)
+    entry_level = beyond(known, entry_atr)
+    stop = initial_stop = beyond(known, -stop_atr)
 
     def reached(index: int, level: float, favorable: bool) -> bool:
         """Whether candle `index` traded at `level` on the profit or loss side."""
@@ -373,8 +394,8 @@ def simulate_pullback(
         exit_at, exit_price, reason = entry_at, stop, "stop"
     else:
         for k in range(entry_at + 1, len(close)):
-            if np.isfinite(dominant[k - 1]):
-                level = beyond(dominant[k - 1], -stop_pct)
+            if np.isfinite(dominant[k - 1]) and np.isfinite(atr[k - 1]):
+                level = beyond(k - 1, -stop_atr)
                 stop = max(stop, level) if long else min(stop, level)
             if reached(k, stop, favorable=False):
                 gapped = sign * (open_[k] - stop) <= 0
@@ -431,23 +452,25 @@ def simulate_pullback(
 def find_pullbacks(
     ticker: str,
     analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
-    entry_pct: float = 1.0,
-    stop_pct: float = 2.0,
+    entry_atr: float = 0.25,
+    stop_atr: float = 0.75,
     max_candles: int = 104,
     cost_pct: float = 0.1,
     max_attempts: int = 3,
     attempt_window: int = 26,
 ) -> list[Trade]:
-    """Trade every pullback to the dominant level, one position per level at a time.
+    """Trade every pullback to the dominant level, one position per idea at a time.
 
-    After `max_attempts` losing pullbacks in a row on the same level, no further
+    An idea is a timeframe and an average length: the SMA and the EMA of the
+    same length are one idea, whichever of the two is dominant at the time.
+    After `max_attempts` losing pullbacks in a row on one idea, no further
     attempt is made until `attempt_window` candles have passed since the last.
     """
     trades: list[Trade] = []
-    busy_until: dict[tuple[str, int, str], int] = {}
-    losses: dict[tuple[str, int, str], tuple[int, int]] = {}  # (count, last entry candle)
+    busy_until: dict[tuple[str, int], int] = {}
+    losses: dict[tuple[str, int], tuple[int, int]] = {}  # (count, last entry candle)
     for setup in iter_dominant_levels(ticker, analyses):
-        level = (setup.timeframe, setup.length, setup.average_type)
+        level = (setup.timeframe, setup.length)
         entry_at = setup.position + 1
         if entry_at <= busy_until.get(level, -1):
             continue
@@ -457,7 +480,7 @@ def find_pullbacks(
                 continue
             count = 0
 
-        trade = simulate_pullback(setup, analyses, entry_pct, stop_pct, max_candles, cost_pct)
+        trade = simulate_pullback(setup, analyses, entry_atr, stop_atr, max_candles, cost_pct)
         if trade is None:
             continue
         trades.append(trade)
@@ -600,8 +623,8 @@ def backtest_ticker(
     start: pd.Timestamp | None = None,
     trail_after_r: float = 1.0,
     setups: tuple[str, ...] = ("break",),
-    pullback_entry_pct: float = 1.0,
-    pullback_stop_pct: float = 2.0,
+    pullback_entry_atr: float = 0.25,
+    pullback_stop_atr: float = 0.75,
 ) -> tuple[list[Trade], int]:
     """Backtest one ticker. Returns its trades and the number of untradable breaks."""
     analyses = scanner.build_candidate_analyses(daily)
@@ -613,8 +636,8 @@ def backtest_ticker(
             for trade in find_pullbacks(
                 ticker,
                 analyses,
-                entry_pct=pullback_entry_pct,
-                stop_pct=pullback_stop_pct,
+                entry_atr=pullback_entry_atr,
+                stop_atr=pullback_stop_atr,
                 max_candles=max_candles,
                 cost_pct=cost_pct,
             )
@@ -761,16 +784,16 @@ def parse_args() -> argparse.Namespace:
         "pullback (return to the dominant average)",
     )
     parser.add_argument(
-        "--pullback-entry-pct",
+        "--pullback-entry-atr",
         type=float,
-        default=1.0,
-        help="pullback entry, in percent on the trend side of the dominant average",
+        default=0.25,
+        help="pullback entry, in ATR on the trend side of the dominant average",
     )
     parser.add_argument(
-        "--pullback-stop-pct",
+        "--pullback-stop-atr",
         type=float,
-        default=2.0,
-        help="pullback stop, in percent beyond the dominant average",
+        default=0.75,
+        help="pullback stop, in ATR beyond the dominant average",
     )
     parser.add_argument("--stop-buffer-pct", type=float, default=0.5)
     parser.add_argument("--max-candles", type=int, default=104)
@@ -806,8 +829,8 @@ def main() -> None:
                 start=start,
                 trail_after_r=args.trail_after_r,
                 setups=setups,
-                pullback_entry_pct=args.pullback_entry_pct,
-                pullback_stop_pct=args.pullback_stop_pct,
+                pullback_entry_atr=args.pullback_entry_atr,
+                pullback_stop_atr=args.pullback_stop_atr,
             )
         except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the run.
             errors[ticker] = str(exc)
@@ -818,8 +841,8 @@ def main() -> None:
     summary = {
         "settings": {
             "setups": list(setups),
-            "pullback_entry_pct": args.pullback_entry_pct,
-            "pullback_stop_pct": args.pullback_stop_pct,
+            "pullback_entry_atr": args.pullback_entry_atr,
+            "pullback_stop_atr": args.pullback_stop_atr,
             "stop": args.stop,
             "stop_buffer_pct": args.stop_buffer_pct,
             "trail_after_r": args.trail_after_r if args.stop == "trail" else None,

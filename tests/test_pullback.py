@@ -91,7 +91,9 @@ def test_deep_dip_enters_and_stops_in_the_same_candle():
     assert first.entry_date == weekly_to_daily(close).index[200 * 5 + 4].date().isoformat()
     assert (first.exit_reason, first.candles_held) == ("stop", 0)
     assert first.exit_price == first.stop_at_entry
-    assert first.r_multiple == pytest.approx(-1, abs=0.1)
+    risk = first.entry_price - first.stop_at_entry
+    costs_in_r = 2 * 0.1 / 100 * first.entry_price / risk
+    assert first.r_multiple == pytest.approx(-1 - costs_in_r, abs=0.01)
 
 
 def test_no_trade_when_price_stays_away_from_the_average():
@@ -152,3 +154,62 @@ def test_summary_separates_breaks_and_pullbacks():
         if name in summary
     )
     assert total == len(trades)
+
+
+def test_entry_and_stop_are_set_in_atr_of_the_signal_timeframe():
+    close, low = uptrend(320)
+    analyses = scanner.build_candidate_analyses(weekly_to_daily(close, low))
+    trade = backtest.find_pullbacks("TEST", analyses, entry_atr=0.25, stop_atr=0.75)[0]
+
+    analysis = analyses[(trade.timeframe, trade.length, trade.average_type)]
+    known = analysis.ohlc.index.get_loc(pd.Timestamp(trade.entry_date)) - 1
+    average = analysis.ma.iloc[known]
+    atr = backtest.calculate_atr(analysis.ohlc)[known]
+    assert trade.stop_at_entry == pytest.approx(average - 0.75 * atr, rel=1e-4)
+    assert trade.entry_price <= average + 0.25 * atr + 1e-9
+
+
+def test_volatile_stock_gets_a_wider_stop():
+    rng = np.random.default_rng(3)
+    close, _ = uptrend(320)
+    calm = close * (1 + rng.normal(0, 0.002, len(close)))
+    wild = close * (1 + rng.normal(0, 0.02, len(close)))
+    distance = {}
+    for name, series in (("calm", calm), ("wild", wild)):
+        ohlc = scanner.resample_ohlc(weekly_to_daily(series), "W-FRI")
+        distance[name] = backtest.calculate_atr(ohlc)[-1] / series[-1]
+    assert distance["wild"] > 5 * distance["calm"]
+
+
+def test_atr_does_not_depend_on_later_candles():
+    ohlc = scanner.resample_ohlc(random_daily(7), "W-FRI")
+    full = backtest.calculate_atr(ohlc)
+    for position in (20, 200, 900):
+        assert backtest.calculate_atr(ohlc.iloc[: position + 1])[-1] == pytest.approx(
+            full[position]
+        )
+
+
+def test_sma_and_ema_of_one_length_share_the_attempts(monkeypatch):
+    """The NVDA 2006 case: three EMA50 losses must not leave room for an SMA50 try."""
+    setups = [
+        backtest.Setup("TEST", pd.Timestamp("2006-01-06"), "Weekly", 50, kind, 1, position)
+        for position, kind in zip(range(100, 106), ["EMA", "EMA", "EMA", "SMA", "SMA", "EMA"])
+    ]
+    monkeypatch.setattr(backtest, "iter_dominant_levels", lambda *args, **kwargs: iter(setups))
+
+    def losing_trade(setup, *args):
+        return backtest.Trade(
+            setup="pullback", ticker="TEST", side="long", timeframe=setup.timeframe,
+            length=setup.length, average_type=setup.average_type, bars_streak=80,
+            streak_touches=5, faulty_candles=0, score=1.0, rsi_at_entry=45.0,
+            negative_divergence=False, positive_divergence=False,
+            entry_date=str(setup.position), entry_price=1.0, target="none",
+            target_at_entry=None, stop_at_entry=0.97, exit_date=str(setup.position),
+            exit_price=0.97, exit_reason="stop", candles_held=0, return_pct=-3.2,
+            r_multiple=-1.07,
+        )
+
+    monkeypatch.setattr(backtest, "simulate_pullback", losing_trade)
+    trades = backtest.find_pullbacks("TEST", analyses={})
+    assert [trade.average_type for trade in trades] == ["EMA", "EMA", "EMA"]
