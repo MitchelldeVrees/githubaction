@@ -155,3 +155,48 @@ def test_summary_counts():
     overall = summary["all"]
     assert overall["closed_trades"] + overall["open_trades"] == len(trades)
     assert sum(overall["exits"].values()) == overall["closed_trades"]
+
+
+def trade_key(trade):
+    return (trade.ticker, trade.timeframe, trade.length, trade.average_type, trade.entry_date)
+
+
+def test_trailing_stop_only_tightens_the_candle_stop():
+    trailed_exits = 0
+    for seed in (5, 6, 7, 8):
+        daily = random_daily(seed)
+        fixed = {trade_key(t): t for t in backtest.backtest_ticker("TEST", daily)[0]}
+        trail = backtest.backtest_ticker("TEST", daily, stop_mode="trail")[0]
+        assert {trade_key(t) for t in trail} == set(fixed)
+
+        for trade in trail:
+            same_signal = fixed[trade_key(trade)]
+            assert trade.stop_at_entry == same_signal.stop_at_entry
+            if trade.exit_reason != "trail":
+                assert trade == same_signal
+                continue
+            trailed_exits += 1
+            assert trade.exit_date <= same_signal.exit_date
+            if trade.side == "short":
+                assert trade.exit_price <= trade.stop_at_entry
+            else:
+                assert trade.exit_price >= trade.stop_at_entry
+    assert trailed_exits > 0
+
+
+def test_trailing_stop_does_not_depend_on_later_data():
+    daily = random_daily(5)
+    full, _ = backtest.backtest_ticker("TEST", daily, stop_mode="trail")
+    closed = [trade for trade in full if trade.exit_reason == "trail"]
+    assert closed
+    for trade in closed[:10]:
+        cutoff = pd.Timestamp(trade.exit_date) + pd.Timedelta(days=7)
+        partial, _ = backtest.backtest_ticker("TEST", daily.loc[:cutoff], stop_mode="trail")
+        assert trade in partial
+
+
+def test_trailing_waits_for_the_required_profit():
+    daily = random_daily(5)
+    never = backtest.backtest_ticker("TEST", daily, stop_mode="trail", trail_after_r=1e9)[0]
+    fixed = backtest.backtest_ticker("TEST", daily)[0]
+    assert never == fixed

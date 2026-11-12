@@ -15,6 +15,9 @@ Trade rules (JDB component 1, break of the dominant average):
 - Stop, chosen with --stop:
     candle   beyond the extreme of the break candle, checked inside each candle
     reclaim  a candle closing back across the dominant average
+    trail    starts as the candle stop; once a candle has closed at least
+             --trail-after-r times the initial risk in profit, the stop follows
+             the dominant average (just beyond it) and only ever tightens
 - A trade still open after --max-candles candles exits at that candle's close.
   A trade still open at the end of the data is reported as open.
 
@@ -216,6 +219,7 @@ def simulate_trade(
     max_candles: int,
     cost_pct: float,
     stop_buffer_pct: float,
+    trail_after_r: float = 1.0,
 ) -> Trade | None:
     """Simulate one signal. Returns None when no target average exists."""
     analysis = analyses[(signal.timeframe, signal.length, signal.average_type)]
@@ -246,17 +250,27 @@ def simulate_trade(
         return None
 
     stop = None
-    if stop_mode == "candle":
-        buffer = 1 + stop_buffer_pct / 100
+    buffer = 1 + stop_buffer_pct / 100
+    if stop_mode in ("candle", "trail"):
         stop = high[entry_at] * buffer if short else low[entry_at] / buffer
+    initial_stop = stop
     risk = abs(stop - entry) if stop is not None else None
+    trailing = False
 
     exit_at, exit_price, reason = len(close) - 1, close[-1], "open"
     for k in range(entry_at + 1, len(close)):
         target = target_series[k - 1]  # known before candle k starts
+        if stop_mode == "trail" and risk:
+            # Everything here uses candle k - 1, so the stop is set before candle k.
+            if not trailing and sign * (close[k - 1] - entry) >= trail_after_r * risk:
+                trailing = True
+            if trailing and np.isfinite(dominant[k - 1]):
+                level = dominant[k - 1] * buffer if short else dominant[k - 1] / buffer
+                stop = min(stop, level) if short else max(stop, level)
         if stop is not None and (high[k] >= stop if short else low[k] <= stop):
             gapped = open_[k] >= stop if short else open_[k] <= stop
-            exit_at, exit_price, reason = k, (open_[k] if gapped else stop), "stop"
+            reason = "stop" if stop == initial_stop else "trail"
+            exit_at, exit_price = k, (open_[k] if gapped else stop)
             break
         if low[k] <= target if short else high[k] >= target:
             gapped = open_[k] <= target if short else open_[k] >= target
@@ -293,7 +307,7 @@ def simulate_trade(
         entry_price=round(float(entry), 4),
         target=f"{signal.timeframe} {target_length}{signal.average_type}",
         target_at_entry=round(float(target_series[entry_at]), 4),
-        stop_at_entry=None if stop is None else round(float(stop), 4),
+        stop_at_entry=None if initial_stop is None else round(float(initial_stop), 4),
         exit_date=pd.Timestamp(dates[exit_at]).date().isoformat(),
         exit_price=round(float(exit_price), 4),
         exit_reason=reason,
@@ -311,6 +325,7 @@ def backtest_ticker(
     cost_pct: float = 0.1,
     stop_buffer_pct: float = 0.5,
     start: pd.Timestamp | None = None,
+    trail_after_r: float = 1.0,
 ) -> tuple[list[Trade], int]:
     """Backtest one ticker. Returns its trades and the number of untradable breaks."""
     analyses = scanner.build_candidate_analyses(daily)
@@ -320,7 +335,7 @@ def backtest_ticker(
         if start is not None and signal.run_date < start:
             continue
         trade = simulate_trade(
-            signal, analyses, stop_mode, max_candles, cost_pct, stop_buffer_pct
+            signal, analyses, stop_mode, max_candles, cost_pct, stop_buffer_pct, trail_after_r
         )
         if trade is None:
             skipped += 1
@@ -367,7 +382,7 @@ def summarize(trades: list[Trade]) -> dict[str, Any]:
         "longest_losing_streak": longest_losing_streak(returns),
         "exits": {
             reason: sum(1 for trade in closed if trade.exit_reason == reason)
-            for reason in ("target", "stop", "time")
+            for reason in ("target", "stop", "trail", "time")
         },
     }
 
@@ -443,7 +458,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--tickers-file", type=Path, default=scanner.TICKERS_FILE)
     parser.add_argument("--start", help="ignore signals before this date (YYYY-MM-DD)")
-    parser.add_argument("--stop", choices=("candle", "reclaim"), default="candle")
+    parser.add_argument("--stop", choices=("candle", "reclaim", "trail"), default="candle")
+    parser.add_argument(
+        "--trail-after-r",
+        type=float,
+        default=1.0,
+        help="with --stop trail: profit, in units of initial risk, before the stop trails",
+    )
     parser.add_argument("--stop-buffer-pct", type=float, default=0.5)
     parser.add_argument("--max-candles", type=int, default=104)
     parser.add_argument("--cost-pct", type=float, default=0.1, help="cost per side, in percent")
@@ -472,6 +493,7 @@ def main() -> None:
                 cost_pct=args.cost_pct,
                 stop_buffer_pct=args.stop_buffer_pct,
                 start=start,
+                trail_after_r=args.trail_after_r,
             )
         except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the run.
             errors[ticker] = str(exc)
@@ -483,6 +505,7 @@ def main() -> None:
         "settings": {
             "stop": args.stop,
             "stop_buffer_pct": args.stop_buffer_pct,
+            "trail_after_r": args.trail_after_r if args.stop == "trail" else None,
             "max_candles": args.max_candles,
             "cost_pct_per_side": args.cost_pct,
             "start": args.start,

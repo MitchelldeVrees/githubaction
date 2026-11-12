@@ -138,6 +138,7 @@ raises.
 ```bash
 python backtest.py                      # stop beyond the break candle
 python backtest.py --stop reclaim       # stop on a close back across the average
+python backtest.py --stop trail         # candle stop that trails the dominant average
 python backtest.py --start 2010-01-01   # ignore older signals
 YFINANCE_AUTO_ADJUST=false python backtest.py   # unadjusted prices
 ```
@@ -146,6 +147,11 @@ Rules: entry at the close of the break candle (short below support, long above
 resistance); target is the next longer average (20 -> 50 -> 200) on the same
 timeframe that lies in the break direction; a trade open after `--max-candles`
 candles (default 104) exits at the close. Costs default to 0.1% per side.
+
+`--stop trail` starts with the candle stop. Once a candle has closed at least
+`--trail-after-r` (default 1) times the initial risk in profit, the stop moves
+to just beyond the dominant average and follows it, only ever tightening. Exits
+on the moved stop are counted as `trail` in the summary.
 
 Each trade records RSI and divergence on the break candle. Divergence filters
 nothing; the summary has `short with divergence`, `short without divergence`,
