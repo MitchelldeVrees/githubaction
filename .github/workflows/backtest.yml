@@ -10,6 +10,7 @@ on:
     paths:
       - backtest.py
       - scanner.py
+      - top_tickers.py
       - tickers_indices.txt
       - .github/workflows/backtest.yml
   workflow_dispatch:
@@ -84,6 +85,19 @@ jobs:
             auto_adjust: "false"
             cache: raw
             args: "--stop-trigger close"
+          # Only today's 100 largest companies of tickers.txt. Expected to flatter
+          # the results (survivorship bias): compare with raw and raw_reviewed.
+          - name: top100_raw
+            auto_adjust: "false"
+            cache: raw
+            top100: "true"
+            args: ""
+          - name: top100_reviewed
+            auto_adjust: "false"
+            cache: raw
+            top100: "true"
+            settings: "DIVERGENCE_SOURCE=close DIVERGENCE_MIN_GAP=8 DIVERGENCE_MIN_PRICE_PCT=1 DIVERGENCE_MIN_RSI_DIFF=3 DIVERGENCE_MAX_AGE=13 TOUCH_CLUSTERS=true TOUCH_IGNORE_LAST=5 CLEAN_FINAL_BARS=20"
+            args: "--stop-trigger close --entry-max-atr 1.5 --skip-target-hit --pullback-lengths 20,50 --pullback-skip-divergence"
           - name: raw_only_pullback
             auto_adjust: "false"
             cache: raw
@@ -110,12 +124,22 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
+      - name: Pick the largest tickers
+        if: matrix.top100 == 'true'
+        run: |
+          mkdir -p results/backtest_${{ matrix.name }}
+          python top_tickers.py --count 100 --out results/backtest_${{ matrix.name }}/tickers_top100.txt
+
+      # Signals from START_DATE on (the last 20 years); the averages still use
+      # all earlier history.
       - name: Run backtest
         env:
           YFINANCE_AUTO_ADJUST: ${{ matrix.auto_adjust }}
           YFINANCE_BATCH_SIZE: "25"
           YFINANCE_BATCH_DELAY_SECONDS: "5"
-        run: env ${{ matrix.settings }} python backtest.py --out results/backtest_${{ matrix.name }} ${{ matrix.args }}
+          START_DATE: "2006-01-01"
+          TICKERS_ARG: ${{ matrix.top100 == 'true' && format('--tickers-file results/backtest_{0}/tickers_top100.txt', matrix.name) || '' }}
+        run: env ${{ matrix.settings }} python backtest.py --out results/backtest_${{ matrix.name }} --start "$START_DATE" $TICKERS_ARG ${{ matrix.args }}
 
       - name: Save Yahoo price cache
         if: always()
