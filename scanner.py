@@ -670,6 +670,19 @@ def find_divergence(
 ) -> bool | None:
     """Detect RSI divergence in the candles before `position`.
 
+    See divergence_swings for the rule; this returns only its answer.
+    """
+    return divergence_swings(price, rsi, position, kind)[0]
+
+
+def divergence_swings(
+    price: np.ndarray,
+    rsi: np.ndarray,
+    position: int,
+    kind: str,
+) -> tuple[bool | None, int | None, int | None]:
+    """Detect RSI divergence and return the two swings that were compared.
+
     kind "negative": the latest swing high in `price` (candle highs) is higher
     than the previous swing high while RSI at that candle is lower.
     kind "positive": the latest swing low in `price` (candle lows) is lower than
@@ -677,10 +690,12 @@ def find_divergence(
 
     Only candles before `position` can be swings and only data up to `position`
     is read, so the answer for a candle never changes when later data arrives.
-    Returns None when RSI is not available yet at `position`.
+    Returns (answer, previous swing, latest swing), with the swings as candle
+    positions. The answer is None when RSI is not available yet at `position`;
+    the swings are None when fewer than two were found.
     """
     if position < 0 or position >= len(price) or not np.isfinite(rsi[position]):
-        return None
+        return None, None, None
 
     values = price if kind == "negative" else -price
     swing = DIVERGENCE_SWING_BARS
@@ -695,13 +710,15 @@ def find_divergence(
             swings.append(index)
 
     if len(swings) < 2:
-        return False
+        return False, None, None
     previous, latest = swings[-2], swings[-1]
     if position - latest > DIVERGENCE_MAX_AGE:
-        return False
+        return False, previous, latest
     if kind == "negative":
-        return bool(price[latest] > price[previous] and rsi[latest] < rsi[previous])
-    return bool(price[latest] < price[previous] and rsi[latest] > rsi[previous])
+        found = price[latest] > price[previous] and rsi[latest] < rsi[previous]
+    else:
+        found = price[latest] < price[previous] and rsi[latest] > rsi[previous]
+    return bool(found), previous, latest
 
 
 def divergence_context(ohlc: pd.DataFrame, position: int) -> dict[str, Any]:

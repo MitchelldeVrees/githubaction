@@ -111,6 +111,35 @@ class Trade:
     candles_held: int
     return_pct: float
     r_multiple: float | None
+    # The two swings behind the divergence in the trade's direction (negative
+    # for a short, positive for a long), on the candle the signal came from.
+    divergence_swing_1_date: str | None = None
+    divergence_swing_1_price: float | None = None
+    divergence_swing_1_rsi: float | None = None
+    divergence_swing_2_date: str | None = None
+    divergence_swing_2_price: float | None = None
+    divergence_swing_2_rsi: float | None = None
+
+
+def swing_details(ohlc: pd.DataFrame, position: int, side: str) -> dict[str, Any]:
+    """The two swings compared for divergence in the trade's direction."""
+    kind = "negative" if side == "short" else "positive"
+    price = ohlc["High" if kind == "negative" else "Low"].to_numpy(dtype=float)
+    rsi = scanner.calculate_rsi(ohlc["Close"]).to_numpy(dtype=float)
+    _, previous, latest = scanner.divergence_swings(price, rsi, position, kind)
+    details: dict[str, Any] = {}
+    for number, index in ((1, previous), (2, latest)):
+        known = index is not None
+        details[f"divergence_swing_{number}_date"] = (
+            pd.Timestamp(ohlc.index[index]).date().isoformat() if known else None
+        )
+        details[f"divergence_swing_{number}_price"] = (
+            round(float(price[index]), 4) if known else None
+        )
+        details[f"divergence_swing_{number}_rsi"] = (
+            round(float(rsi[index]), 1) if known else None
+        )
+    return details
 
 
 def candidate_arrays(
@@ -456,6 +485,7 @@ def simulate_pullback(
         candles_held=exit_at - entry_at,
         return_pct=round(float(return_pct), 3),
         r_multiple=round(float(r_multiple), 3),
+        **swing_details(ohlc, known, "long" if long else "short"),
     )
 
 
@@ -623,6 +653,7 @@ def simulate_trade(
         candles_held=exit_at - entry_at,
         return_pct=round(float(return_pct), 3),
         r_multiple=None if r_multiple is None else round(float(r_multiple), 3),
+        **swing_details(ohlc, entry_at, "short" if short else "long"),
     )
 
 
@@ -701,6 +732,7 @@ def simulate_retracement(
     first = max(0, broke - signal.bars_streak)
     top = float(np.max(high[first : broke + 1]))
     divergence = scanner.divergence_context(ohlc, broke)
+    swings = swing_details(ohlc, broke, "short")
 
     trades: list[Trade] = []
     swing_low = float(np.min(low[int(np.argmax(high[first : broke + 1])) + first : broke + 1]))
@@ -779,6 +811,7 @@ def simulate_retracement(
                     candles_held=exit_at - entry_at,
                     return_pct=round(float(return_pct), 3),
                     r_multiple=round(float(r_multiple), 3),
+                    **swings,
                 )
             )
             if reason != "stop":

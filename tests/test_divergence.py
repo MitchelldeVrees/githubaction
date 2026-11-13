@@ -134,3 +134,35 @@ def test_backtest_records_and_groups_divergence():
     )
     known = sum(1 for trade in trades if backtest.confirming_divergence(trade) is not None)
     assert counted == known
+
+
+def test_swings_are_the_ones_compared():
+    closes = path(FLAT, FAST_RALLY, PULLBACK)
+    closes += choppy(closes[-1], 153.0, 24)
+    closes += list(np.linspace(closes[-1], 140.0, 5)[1:])
+    ohlc = candles(closes)
+    rsi = scanner.calculate_rsi(ohlc["Close"]).to_numpy()
+    high = ohlc["High"].to_numpy()
+    found, first, second = scanner.divergence_swings(high, rsi, len(ohlc) - 1, "negative")
+    assert found is True
+    assert high[second] > high[first] and rsi[second] < rsi[first]
+
+    details = backtest.swing_details(ohlc, len(ohlc) - 1, "short")
+    assert details["divergence_swing_1_date"] == ohlc.index[first].date().isoformat()
+    assert details["divergence_swing_2_price"] == round(float(high[second]), 4)
+
+
+def test_backtest_trades_carry_their_swings():
+    trades, _ = backtest.backtest_ticker(
+        "TEST", random_daily(6), setups=("break", "pullback", "retracement")
+    )
+    with_divergence = [t for t in trades if backtest.confirming_divergence(t)]
+    assert with_divergence
+    for trade in with_divergence:
+        assert trade.divergence_swing_1_date < trade.divergence_swing_2_date <= trade.entry_date
+        if trade.side == "short":
+            assert trade.divergence_swing_2_price > trade.divergence_swing_1_price
+            assert trade.divergence_swing_2_rsi < trade.divergence_swing_1_rsi
+        else:
+            assert trade.divergence_swing_2_price < trade.divergence_swing_1_price
+            assert trade.divergence_swing_2_rsi > trade.divergence_swing_1_rsi
