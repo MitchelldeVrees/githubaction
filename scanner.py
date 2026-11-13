@@ -85,6 +85,19 @@ DOMINANT_LENGTHS = tuple(
     int(value) for value in env_str("DOMINANT_LENGTHS", "20,50,200").split(",") if value.strip()
 )
 
+# Stricter dominance, from reviewing trades on the chart. All off by default.
+#
+# TOUCH_CLUSTERS: candles touching the average back to back count as one touch,
+#   so two touches need price to leave the average and come back.
+# TOUCH_IGNORE_LAST: touches in the last N candles before the measured candle
+#   do not count, so touches made while price is already falling into the
+#   break do not make the level dominant.
+# CLEAN_FINAL_BARS: a tolerated close call must be more than N candles old;
+#   a recent close on the wrong side ends the streak as any other would.
+TOUCH_CLUSTERS = env_bool("TOUCH_CLUSTERS", False)
+TOUCH_IGNORE_LAST = env_int("TOUCH_IGNORE_LAST", 0)
+CLEAN_FINAL_BARS = env_int("CLEAN_FINAL_BARS", 0)
+
 # RSI divergence, reported as context next to each dominant level. A swing is a
 # candle whose high (or low) is the extreme of DIVERGENCE_SWING_BARS candles on
 # each side. The last two swings within DIVERGENCE_LOOKBACK candles are
@@ -94,6 +107,19 @@ RSI_LENGTH = env_int("RSI_LENGTH", 14)
 DIVERGENCE_SWING_BARS = env_int("DIVERGENCE_SWING_BARS", 5)
 DIVERGENCE_LOOKBACK = env_int("DIVERGENCE_LOOKBACK", 100)
 DIVERGENCE_MAX_AGE = env_int("DIVERGENCE_MAX_AGE", 26)
+
+# Stricter divergence, from reviewing trades on the chart. Off by default.
+#
+# DIVERGENCE_SOURCE: "wick" compares candle highs (or lows), "close" compares
+#   closes, so a single wick cannot make a divergence.
+# DIVERGENCE_MIN_GAP: the two swings must be at least this many candles apart;
+#   a nearer previous swing is skipped for an older one.
+# DIVERGENCE_MIN_PRICE_PCT / DIVERGENCE_MIN_RSI_DIFF: how far the second swing
+#   must be beyond the first in price (percent) and back in RSI (points).
+DIVERGENCE_SOURCE = env_str("DIVERGENCE_SOURCE", "wick")
+DIVERGENCE_MIN_GAP = env_int("DIVERGENCE_MIN_GAP", 0)
+DIVERGENCE_MIN_PRICE_PCT = env_float("DIVERGENCE_MIN_PRICE_PCT", 0.0)
+DIVERGENCE_MIN_RSI_DIFF = env_float("DIVERGENCE_MIN_RSI_DIFF", 0.0)
 
 SEND_NO_SIGNAL_MESSAGE = env_bool("SEND_NO_SIGNAL_MESSAGE", True)
 TICKERS_FILE = env_path("TICKERS_FILE", "tickers.txt")
@@ -709,16 +735,35 @@ def divergence_swings(
         if left + int(np.argmax(window)) == index:
             swings.append(index)
 
-    if len(swings) < 2:
+    if not swings:
         return False, None, None
-    previous, latest = swings[-2], swings[-1]
+    latest = swings[-1]
+    earlier = [index for index in swings[:-1] if latest - index >= DIVERGENCE_MIN_GAP]
+    if not earlier:
+        return False, None, None
+    previous = earlier[-1]
     if position - latest > DIVERGENCE_MAX_AGE:
         return False, previous, latest
-    if kind == "negative":
-        found = price[latest] > price[previous] and rsi[latest] < rsi[previous]
-    else:
-        found = price[latest] < price[previous] and rsi[latest] > rsi[previous]
+    # Signed so that a divergence is positive in both: price further, RSI back.
+    sign = 1.0 if kind == "negative" else -1.0
+    price_move = sign * (price[latest] / price[previous] - 1) * 100
+    rsi_move = sign * (rsi[previous] - rsi[latest])
+    found = (
+        price_move > 0
+        and rsi_move > 0
+        and price_move >= DIVERGENCE_MIN_PRICE_PCT
+        and rsi_move >= DIVERGENCE_MIN_RSI_DIFF
+    )
     return bool(found), previous, latest
+
+
+def divergence_price(ohlc: pd.DataFrame, kind: str) -> np.ndarray:
+    """The prices whose swings are compared: closes, or highs/lows (wicks)."""
+    if DIVERGENCE_SOURCE == "close":
+        column = "Close"
+    else:
+        column = "High" if kind == "negative" else "Low"
+    return ohlc[column].to_numpy(dtype=float)
 
 
 def divergence_context(ohlc: pd.DataFrame, position: int) -> dict[str, Any]:
@@ -727,10 +772,10 @@ def divergence_context(ohlc: pd.DataFrame, position: int) -> dict[str, Any]:
     return {
         "rsi": clean_number(rsi[position], decimals=1),
         "negative_divergence": find_divergence(
-            ohlc["High"].to_numpy(dtype=float), rsi, position, "negative"
+            divergence_price(ohlc, "negative"), rsi, position, "negative"
         ),
         "positive_divergence": find_divergence(
-            ohlc["Low"].to_numpy(dtype=float), rsi, position, "positive"
+            divergence_price(ohlc, "positive"), rsi, position, "positive"
         ),
     }
 
@@ -755,13 +800,16 @@ def bars_since_true(condition: pd.Series) -> pd.Series:
 def tolerant_streaks(
     on_side: np.ndarray,
     close_call: np.ndarray,
+    clean_final: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Count how long price has stayed on one side of an average.
 
     `on_side` marks candles closing on the dominant side. `close_call` marks
     candles closing on the wrong side by a small margin. One close call between
     two runs is treated as noise and joins them; anything else ends the streak.
-    The candle being measured must itself be on the dominant side.
+    The candle being measured must itself be on the dominant side. With
+    `clean_final`, a close call is only tolerated once it is more than that
+    many candles old; until then the streak counts from after it.
 
     Returns, per candle: the number of on-side candles in the streak, the number
     of candles the streak spans (including a tolerated one), and the number of
@@ -776,8 +824,9 @@ def tolerant_streaks(
     for index in range(count):
         if on_side[index]:
             run += 1
-            streak[index] = run + carried
-            faults[index] = 1 if carried else 0
+            tolerated = carried if run > clean_final else 0
+            streak[index] = run + tolerated
+            faults[index] = 1 if tolerated else 0
             span[index] = streak[index] + faults[index]
         else:
             carried = run if (close_call[index] and run > 0) else 0
@@ -785,11 +834,26 @@ def tolerant_streaks(
     return streak, span, faults
 
 
-def touches_within(touches: pd.Series, span: np.ndarray) -> np.ndarray:
-    """Count the touches inside the last `span` candles, for every candle."""
+def touches_within(
+    touches: pd.Series,
+    span: np.ndarray,
+    ignore_last: int = 0,
+) -> np.ndarray:
+    """Count the touches inside the last `span` candles, for every candle.
+
+    With `ignore_last`, touches in the last that many candles are not counted.
+    """
     running = np.concatenate([[0], np.cumsum(touches.to_numpy(dtype="int64"))])
     ends = np.arange(1, len(span) + 1)
-    return running[ends] - running[np.maximum(ends - span, 0)]
+    starts = np.maximum(ends - span, 0)
+    stops = np.maximum(ends - ignore_last, starts)
+    return running[stops] - running[starts]
+
+
+def touch_events(touches: pd.Series) -> pd.Series:
+    """Keep only the first candle of each run of touching candles."""
+    touching = touches.fillna(False).astype(bool)
+    return touching & ~touching.shift(1, fill_value=False)
 
 
 def analyze_candidate(
@@ -819,10 +883,10 @@ def analyze_candidate(
     if FAULTY_CANDLES_ALLOWED > 0:
         close_call = ((close / ma - 1).abs() <= FAULTY_CANDLE_MAX_PCT / 100).to_numpy()
         above, above_span, above_faults = tolerant_streaks(
-            ((close > ma) & established).to_numpy(), close_call
+            ((close > ma) & established).to_numpy(), close_call, CLEAN_FINAL_BARS
         )
         below, below_span, below_faults = tolerant_streaks(
-            ((close < ma) & established).to_numpy(), close_call
+            ((close < ma) & established).to_numpy(), close_call, CLEAN_FINAL_BARS
         )
         bars_above_streak = pd.Series(above, index=ohlc.index)
         bars_below_streak = pd.Series(below, index=ohlc.index)
@@ -833,11 +897,16 @@ def analyze_candidate(
         below_span = bars_below_streak.to_numpy()
         above_faults = below_faults = np.zeros(len(close), dtype="int64")
 
+    support_touches = bullish_bounce & established
+    resistance_touches = bearish_reject & established
+    if TOUCH_CLUSTERS:
+        support_touches = touch_events(support_touches)
+        resistance_touches = touch_events(resistance_touches)
     above_touches = pd.Series(
-        touches_within(bullish_bounce & established, above_span), index=ohlc.index
+        touches_within(support_touches, above_span, TOUCH_IGNORE_LAST), index=ohlc.index
     )
     below_touches = pd.Series(
-        touches_within(bearish_reject & established, below_span), index=ohlc.index
+        touches_within(resistance_touches, below_span, TOUCH_IGNORE_LAST), index=ohlc.index
     )
 
     bull_bounces = bullish_bounce.astype(int).rolling(

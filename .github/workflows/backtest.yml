@@ -54,6 +54,40 @@ jobs:
             auto_adjust: "true"
             cache: indices
             args: "--tickers-file tickers_indices.txt --setups pullback --pullback-target none --baseline 3"
+          # The rules from reviewing trades on the chart (Nov 2026), on unadjusted
+          # prices like TradingView: all together, then each change on its own.
+          - name: raw_reviewed
+            auto_adjust: "false"
+            cache: raw
+            settings: "DIVERGENCE_SOURCE=close DIVERGENCE_MIN_GAP=8 DIVERGENCE_MIN_PRICE_PCT=1 DIVERGENCE_MIN_RSI_DIFF=3 DIVERGENCE_MAX_AGE=13 TOUCH_CLUSTERS=true TOUCH_IGNORE_LAST=5 CLEAN_FINAL_BARS=20"
+            args: "--stop-trigger close --entry-max-atr 1.5 --skip-target-hit --pullback-lengths 20,50 --pullback-skip-divergence"
+          - name: raw_reviewed_baseline
+            auto_adjust: "false"
+            cache: raw
+            settings: "DIVERGENCE_SOURCE=close DIVERGENCE_MIN_GAP=8 DIVERGENCE_MIN_PRICE_PCT=1 DIVERGENCE_MIN_RSI_DIFF=3 DIVERGENCE_MAX_AGE=13 TOUCH_CLUSTERS=true TOUCH_IGNORE_LAST=5 CLEAN_FINAL_BARS=20"
+            args: "--setups break,retracement --stop-trigger close --entry-max-atr 1.5 --skip-target-hit --baseline 5"
+          - name: raw_only_dominance
+            auto_adjust: "false"
+            cache: raw
+            settings: "TOUCH_CLUSTERS=true TOUCH_IGNORE_LAST=5 CLEAN_FINAL_BARS=20"
+            args: ""
+          - name: raw_only_divergence
+            auto_adjust: "false"
+            cache: raw
+            settings: "DIVERGENCE_SOURCE=close DIVERGENCE_MIN_GAP=8 DIVERGENCE_MIN_PRICE_PCT=1 DIVERGENCE_MIN_RSI_DIFF=3 DIVERGENCE_MAX_AGE=13"
+            args: ""
+          - name: raw_only_entry
+            auto_adjust: "false"
+            cache: raw
+            args: "--entry-max-atr 1.5 --skip-target-hit"
+          - name: raw_only_close_stop
+            auto_adjust: "false"
+            cache: raw
+            args: "--stop-trigger close"
+          - name: raw_only_pullback
+            auto_adjust: "false"
+            cache: raw
+            args: "--setups pullback --pullback-lengths 20,50 --pullback-skip-divergence"
 
     steps:
       - name: Check out repository
@@ -81,7 +115,7 @@ jobs:
           YFINANCE_AUTO_ADJUST: ${{ matrix.auto_adjust }}
           YFINANCE_BATCH_SIZE: "25"
           YFINANCE_BATCH_DELAY_SECONDS: "5"
-        run: python backtest.py --out results/backtest_${{ matrix.name }} ${{ matrix.args }}
+        run: env ${{ matrix.settings }} python backtest.py --out results/backtest_${{ matrix.name }} ${{ matrix.args }}
 
       - name: Save Yahoo price cache
         if: always()

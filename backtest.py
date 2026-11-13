@@ -124,7 +124,7 @@ class Trade:
 def swing_details(ohlc: pd.DataFrame, position: int, side: str) -> dict[str, Any]:
     """The two swings compared for divergence in the trade's direction."""
     kind = "negative" if side == "short" else "positive"
-    price = ohlc["High" if kind == "negative" else "Low"].to_numpy(dtype=float)
+    price = scanner.divergence_price(ohlc, kind)
     rsi = scanner.calculate_rsi(ohlc["Close"]).to_numpy(dtype=float)
     _, previous, latest = scanner.divergence_swings(price, rsi, position, kind)
     details: dict[str, Any] = {}
@@ -353,6 +353,8 @@ def simulate_pullback(
     max_candles: int,
     cost_pct: float,
     use_target: bool = True,
+    stop_trigger: str = "intrabar",
+    skip_divergence: bool = False,
 ) -> Trade | None:
     """Simulate a pullback to the dominant average in the candle after `setup`.
 
@@ -371,8 +373,12 @@ def simulate_pullback(
       no target and the trailed stop alone ends the trade.
 
     The average of the last completed candle is used for the entry and stop of
-    the candle being traded. Returns None when the candle never reaches the
-    entry level, or when the ATR is not known yet.
+    the candle being traded. With `stop_trigger` "close", the stop only ends the
+    trade when a candle closes beyond it, at that close. With
+    `skip_divergence`, no pullback is taken while either RSI divergence stands:
+    a divergence warns of a turn, a pullback bets on the trend.
+    Returns None when the candle never reaches the entry level, when the ATR is
+    not known yet, or when the pullback is skipped.
     """
     analysis = analyses[(setup.timeframe, setup.length, setup.average_type)]
     ohlc = analysis.ohlc
@@ -388,6 +394,11 @@ def simulate_pullback(
     dominant = analysis.ma.to_numpy(dtype=float)
     atr = calculate_atr(ohlc)
     if not np.isfinite(atr[known]):
+        return None
+    divergence = scanner.divergence_context(ohlc, known)
+    if skip_divergence and (
+        divergence["negative_divergence"] or divergence["positive_divergence"]
+    ):
         return None
     long = setup.direction == SUPPORT
     sign = 1.0 if long else -1.0
@@ -427,16 +438,24 @@ def simulate_pullback(
         if target_series is None or abs(value - entry) < abs(target_series[known] - entry):
             target_length, target_series = length, series
 
+    on_close = stop_trigger == "close"
+
+    def stopped(index: int) -> bool:
+        """Whether candle `index` triggers the stop, on its range or its close."""
+        if on_close:
+            return bool(sign * (close[index] - stop) <= 0)
+        return reached(index, stop, favorable=False)
+
     exit_at, exit_price, reason = len(close) - 1, close[-1], "open"
-    if reached(entry_at, stop, favorable=False):
+    if stopped(entry_at):
         # Price fell through the entry and on to the stop within the same candle.
-        exit_at, exit_price, reason = entry_at, stop, "stop"
+        exit_at, exit_price, reason = entry_at, (close[entry_at] if on_close else stop), "stop"
     else:
         for k in range(entry_at + 1, len(close)):
             if np.isfinite(dominant[k - 1]) and np.isfinite(atr[k - 1]):
                 level = beyond(k - 1, -stop_atr)
                 stop = max(stop, level) if long else min(stop, level)
-            if reached(k, stop, favorable=False):
+            if not on_close and stopped(k):
                 gapped = sign * (open_[k] - stop) <= 0
                 reason = "stop" if stop == initial_stop else "trail"
                 exit_at, exit_price = k, (open_[k] if gapped else stop)
@@ -446,13 +465,16 @@ def simulate_pullback(
                 gapped = sign * (open_[k] - target) >= 0
                 exit_at, exit_price, reason = k, (open_[k] if gapped else target), "target"
                 break
+            if on_close and stopped(k):
+                reason = "stop" if stop == initial_stop else "trail"
+                exit_at, exit_price = k, close[k]
+                break
             if k - entry_at >= max_candles:
                 exit_at, exit_price, reason = k, close[k], "time"
                 break
 
     return_pct = sign * (exit_price / entry - 1) * 100 - 2 * cost_pct
     r_multiple = sign * (exit_price - entry) / risk - 2 * cost_pct / 100 * entry / risk
-    divergence = scanner.divergence_context(ohlc, known)
 
     return Trade(
         setup="pullback",
@@ -499,6 +521,9 @@ def find_pullbacks(
     max_attempts: int = 3,
     attempt_window: int = 26,
     use_target: bool = True,
+    lengths: tuple[int, ...] | None = None,
+    stop_trigger: str = "intrabar",
+    skip_divergence: bool = False,
 ) -> list[Trade]:
     """Trade every pullback to the dominant level, one position per idea at a time.
 
@@ -506,11 +531,15 @@ def find_pullbacks(
     same length are one idea, whichever of the two is dominant at the time.
     After `max_attempts` losing pullbacks in a row on one idea, no further
     attempt is made until `attempt_window` candles have passed since the last.
+    With `lengths`, only pullbacks to dominant averages of those lengths are
+    traded.
     """
     trades: list[Trade] = []
     busy_until: dict[tuple[str, int], int] = {}
     losses: dict[tuple[str, int], tuple[int, int]] = {}  # (count, last entry candle)
     for setup in iter_dominant_levels(ticker, analyses):
+        if lengths is not None and setup.length not in lengths:
+            continue
         level = (setup.timeframe, setup.length)
         entry_at = setup.position + 1
         if entry_at <= busy_until.get(level, -1):
@@ -522,7 +551,15 @@ def find_pullbacks(
             count = 0
 
         trade = simulate_pullback(
-            setup, analyses, entry_atr, stop_atr, max_candles, cost_pct, use_target
+            setup,
+            analyses,
+            entry_atr,
+            stop_atr,
+            max_candles,
+            cost_pct,
+            use_target,
+            stop_trigger=stop_trigger,
+            skip_divergence=skip_divergence,
         )
         if trade is None:
             continue
@@ -556,8 +593,18 @@ def simulate_trade(
     cost_pct: float,
     stop_buffer_pct: float,
     trail_after_r: float = 1.0,
+    stop_trigger: str = "intrabar",
+    entry_max_atr: float | None = None,
+    skip_target_hit: bool = False,
 ) -> Trade | None:
-    """Simulate one signal. Returns None when no target average exists."""
+    """Simulate one signal.
+
+    Returns None when no target average exists, or when the break is skipped:
+    with `skip_target_hit`, when the break candle itself already traded at the
+    target; with `entry_max_atr`, when the break candle closed more than that
+    many ATR beyond the dominant average. With `stop_trigger` "close", the stop
+    only ends the trade when a candle closes beyond it, at that close.
+    """
     analysis = analyses[(signal.timeframe, signal.length, signal.average_type)]
     ohlc = analysis.ohlc
     dates = ohlc.index
@@ -584,6 +631,16 @@ def simulate_trade(
             break
     if target_series is None:
         return None
+    if skip_target_hit and (
+        low[entry_at] <= target_series[entry_at]
+        if short
+        else high[entry_at] >= target_series[entry_at]
+    ):
+        return None
+    if entry_max_atr is not None:
+        atr = calculate_atr(ohlc)[entry_at]
+        if not np.isfinite(atr) or abs(entry - dominant[entry_at]) > entry_max_atr * atr:
+            return None
 
     stop = None
     buffer = 1 + stop_buffer_pct / 100
@@ -603,7 +660,12 @@ def simulate_trade(
             if trailing and np.isfinite(dominant[k - 1]):
                 level = dominant[k - 1] * buffer if short else dominant[k - 1] / buffer
                 stop = min(stop, level) if short else max(stop, level)
-        if stop is not None and (high[k] >= stop if short else low[k] <= stop):
+        on_close = stop_trigger == "close"
+        if (
+            not on_close
+            and stop is not None
+            and (high[k] >= stop if short else low[k] <= stop)
+        ):
             gapped = open_[k] >= stop if short else open_[k] <= stop
             reason = "stop" if stop == initial_stop else "trail"
             exit_at, exit_price = k, (open_[k] if gapped else stop)
@@ -611,6 +673,10 @@ def simulate_trade(
         if low[k] <= target if short else high[k] >= target:
             gapped = open_[k] <= target if short else open_[k] >= target
             exit_at, exit_price, reason = k, (open_[k] if gapped else target), "target"
+            break
+        if on_close and stop is not None and (close[k] >= stop if short else close[k] <= stop):
+            reason = "stop" if stop == initial_stop else "trail"
+            exit_at, exit_price = k, close[k]
             break
         if stop_mode == "reclaim" and (
             close[k] > dominant[k] if short else close[k] < dominant[k]
@@ -1070,6 +1136,11 @@ def backtest_ticker(
     retrace_max_wait: int = 52,
     retrace_attempts: int = 3,
     pullback_target: str = "next",
+    stop_trigger: str = "intrabar",
+    entry_max_atr: float | None = None,
+    skip_target_hit: bool = False,
+    pullback_lengths: tuple[int, ...] | None = None,
+    pullback_skip_divergence: bool = False,
 ) -> tuple[list[Trade], int]:
     """Backtest one ticker. Returns its trades and the number of untradable breaks."""
     analyses = scanner.build_candidate_analyses(daily)
@@ -1102,6 +1173,9 @@ def backtest_ticker(
                 max_candles=max_candles,
                 cost_pct=cost_pct,
                 use_target=pullback_target == "next",
+                lengths=pullback_lengths,
+                stop_trigger=stop_trigger,
+                skip_divergence=pullback_skip_divergence,
             )
             if start is None or pd.Timestamp(trade.entry_date) >= start
         )
@@ -1109,7 +1183,16 @@ def backtest_ticker(
         if start is not None and signal.run_date < start:
             continue
         trade = simulate_trade(
-            signal, analyses, stop_mode, max_candles, cost_pct, stop_buffer_pct, trail_after_r
+            signal,
+            analyses,
+            stop_mode,
+            max_candles,
+            cost_pct,
+            stop_buffer_pct,
+            trail_after_r,
+            stop_trigger=stop_trigger,
+            entry_max_atr=entry_max_atr,
+            skip_target_hit=skip_target_hit,
         )
         if trade is None:
             skipped += 1
@@ -1289,6 +1372,34 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help="pullback stop, in ATR beyond the dominant average",
     )
+    parser.add_argument(
+        "--stop-trigger",
+        choices=("intrabar", "close"),
+        default="intrabar",
+        help="break and pullback stops: hit by any trade (intrabar) or only by a "
+        "candle close beyond the stop (close)",
+    )
+    parser.add_argument(
+        "--entry-max-atr",
+        type=float,
+        default=None,
+        help="skip a break whose candle closes more than this many ATR beyond the average",
+    )
+    parser.add_argument(
+        "--skip-target-hit",
+        action="store_true",
+        help="skip a break whose own candle already traded at the target",
+    )
+    parser.add_argument(
+        "--pullback-lengths",
+        default=None,
+        help="comma-separated average lengths a pullback may be traded at, e.g. 20,50",
+    )
+    parser.add_argument(
+        "--pullback-skip-divergence",
+        action="store_true",
+        help="take no pullback while an RSI divergence stands",
+    )
     parser.add_argument("--stop-buffer-pct", type=float, default=0.5)
     parser.add_argument("--max-candles", type=int, default=104)
     parser.add_argument("--cost-pct", type=float, default=0.1, help="cost per side, in percent")
@@ -1303,6 +1414,11 @@ def main() -> None:
     unknown = set(setups) - {"break", "pullback", "retracement"}
     if unknown:
         raise SystemExit(f"Unknown setup: {', '.join(sorted(unknown))}")
+    pullback_lengths = (
+        tuple(int(value) for value in args.pullback_lengths.split(",") if value.strip())
+        if args.pullback_lengths
+        else None
+    )
     tickers = scanner.load_tickers(args.tickers_file)
     price_data, errors = scanner.download_price_data_bulk(tickers)
 
@@ -1335,6 +1451,11 @@ def main() -> None:
                 retrace_max_wait=args.retrace_max_wait,
                 retrace_attempts=args.retrace_attempts,
                 pullback_target=args.pullback_target,
+                stop_trigger=args.stop_trigger,
+                entry_max_atr=args.entry_max_atr,
+                skip_target_hit=args.skip_target_hit,
+                pullback_lengths=pullback_lengths,
+                pullback_skip_divergence=args.pullback_skip_divergence,
             )
         except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the run.
             errors[ticker] = str(exc)
@@ -1380,6 +1501,19 @@ def main() -> None:
             "faulty_candles_allowed": scanner.FAULTY_CANDLES_ALLOWED,
             "faulty_candle_max_pct": scanner.FAULTY_CANDLE_MAX_PCT,
             "dominant_lengths": list(scanner.DOMINANT_LENGTHS),
+            "stop_trigger": args.stop_trigger,
+            "entry_max_atr": args.entry_max_atr,
+            "skip_target_hit": args.skip_target_hit,
+            "pullback_lengths": list(pullback_lengths) if pullback_lengths else None,
+            "pullback_skip_divergence": args.pullback_skip_divergence,
+            "touch_clusters": scanner.TOUCH_CLUSTERS,
+            "touch_ignore_last": scanner.TOUCH_IGNORE_LAST,
+            "clean_final_bars": scanner.CLEAN_FINAL_BARS,
+            "divergence_source": scanner.DIVERGENCE_SOURCE,
+            "divergence_min_gap": scanner.DIVERGENCE_MIN_GAP,
+            "divergence_min_price_pct": scanner.DIVERGENCE_MIN_PRICE_PCT,
+            "divergence_min_rsi_diff": scanner.DIVERGENCE_MIN_RSI_DIFF,
+            "divergence_max_age": scanner.DIVERGENCE_MAX_AGE,
         },
         "tickers": len(tickers),
         "tickers_with_errors": len(errors),
@@ -1415,7 +1549,7 @@ def main() -> None:
     print_summary(summary)
     print(
         f"\n{len(trades)} trades from {len(tickers) - len(errors)} tickers; "
-        f"{skipped} breaks had no average left to target; {len(errors)} tickers failed."
+        f"{skipped} breaks were skipped (no average left to target, or filtered); {len(errors)} tickers failed."
 
     )
     print(f"Wrote {args.out / 'backtest_trades.csv'} and {args.out / 'backtest_summary.json'}")

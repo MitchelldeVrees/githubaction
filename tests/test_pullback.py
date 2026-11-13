@@ -198,7 +198,7 @@ def test_sma_and_ema_of_one_length_share_the_attempts(monkeypatch):
     ]
     monkeypatch.setattr(backtest, "iter_dominant_levels", lambda *args, **kwargs: iter(setups))
 
-    def losing_trade(setup, *args):
+    def losing_trade(setup, *args, **kwargs):
         return backtest.Trade(
             setup="pullback", ticker="TEST", side="long", timeframe=setup.timeframe,
             length=setup.length, average_type=setup.average_type, bars_streak=80,
