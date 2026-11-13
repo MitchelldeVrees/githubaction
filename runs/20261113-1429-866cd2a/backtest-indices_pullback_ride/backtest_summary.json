@@ -1,0 +1,411 @@
+{
+  "settings": {
+    "setups": [
+      "pullback"
+    ],
+    "pullback_entry_atr": 0.25,
+    "pullback_stop_atr": 0.75,
+    "pullback_target": "none",
+    "retrace_max_wait": 52,
+    "retrace_attempts": 3,
+    "max_daily_jump": 4.0,
+    "stop": "candle",
+    "stop_buffer_pct": 0.5,
+    "trail_after_r": null,
+    "max_candles": 104,
+    "cost_pct_per_side": 0.1,
+    "start": "2006-01-01",
+    "prices": "dividend adjusted",
+    "min_touches": 2,
+    "faulty_candles_allowed": 1,
+    "faulty_candle_max_pct": 2.0,
+    "dominant_lengths": [
+      20,
+      50,
+      200
+    ],
+    "stop_trigger": "intrabar",
+    "entry_max_atr": null,
+    "skip_target_hit": false,
+    "pullback_lengths": null,
+    "pullback_skip_divergence": false,
+    "touch_clusters": false,
+    "touch_ignore_last": 0,
+    "clean_final_bars": 0,
+    "divergence_source": "wick",
+    "divergence_min_gap": 0,
+    "divergence_min_price_pct": 0.0,
+    "divergence_min_rsi_diff": 0.0,
+    "divergence_max_age": 26
+  },
+  "tickers": 44,
+  "tickers_with_errors": 0,
+  "tickers_cut_for_data_errors": [],
+  "breaks_without_target": 0,
+  "groups": {
+    "all": {
+      "closed_trades": 857,
+      "open_trades": 17,
+      "win_rate_pct": 17.4,
+      "avg_win_pct": 33.998,
+      "avg_loss_pct": -4.797,
+      "expectancy_pct": 1.948,
+      "median_return_pct": -3.648,
+      "avg_r": 0.153,
+      "median_candles_held": 3,
+      "longest_losing_streak": 88,
+      "exits": {
+        "target": 0,
+        "stop": 327,
+        "trail": 488,
+        "time": 42
+      }
+    },
+    "pullback long": {
+      "closed_trades": 556,
+      "open_trades": 17,
+      "win_rate_pct": 22.7,
+      "avg_win_pct": 38.433,
+      "avg_loss_pct": -4.746,
+      "expectancy_pct": 5.039,
+      "median_return_pct": -3.265,
+      "avg_r": 0.599,
+      "median_candles_held": 2,
+      "longest_losing_streak": 43,
+      "exits": {
+        "target": 0,
+        "stop": 243,
+        "trail": 274,
+        "time": 39
+      }
+    },
+    "pullback long / Biweekly 200": {
+      "closed_trades": 66,
+      "open_trades": 2,
+      "win_rate_pct": 22.7,
+      "avg_win_pct": 66.296,
+      "avg_loss_pct": -7.332,
+      "expectancy_pct": 9.402,
+      "median_return_pct": -5.595,
+      "avg_r": 1.113,
+      "median_candles_held": 2,
+      "longest_losing_streak": 17,
+      "exits": {
+        "target": 0,
+        "stop": 31,
+        "trail": 25,
+        "time": 10
+      }
+    },
+    "pullback long / Biweekly 50": {
+      "closed_trades": 13,
+      "open_trades": 0,
+      "win_rate_pct": 30.8,
+      "avg_win_pct": 12.042,
+      "avg_loss_pct": -5.557,
+      "expectancy_pct": -0.142,
+      "median_return_pct": -3.705,
+      "avg_r": 0.499,
+      "median_candles_held": 1,
+      "longest_losing_streak": 3,
+      "exits": {
+        "target": 0,
+        "stop": 6,
+        "trail": 7,
+        "time": 0
+      }
+    },
+    "pullback long / Monthly 20": {
+      "closed_trades": 2,
+      "open_trades": 0,
+      "win_rate_pct": 0.0,
+      "avg_win_pct": null,
+      "avg_loss_pct": -5.425,
+      "expectancy_pct": -5.425,
+      "median_return_pct": -5.425,
+      "avg_r": -1.052,
+      "median_candles_held": 0,
+      "longest_losing_streak": 2,
+      "exits": {
+        "target": 0,
+        "stop": 2,
+        "trail": 0,
+        "time": 0
+      }
+    },
+    "pullback long / Monthly 200": {
+      "closed_trades": 7,
+      "open_trades": 5,
+      "win_rate_pct": 28.6,
+      "avg_win_pct": 50.052,
+      "avg_loss_pct": -6.03,
+      "expectancy_pct": 9.993,
+      "median_return_pct": -5.825,
+      "avg_r": 0.45,
+      "median_candles_held": 0,
+      "longest_losing_streak": 4,
+      "exits": {
+        "target": 0,
+        "stop": 4,
+        "trail": 2,
+        "time": 1
+      }
+    },
+    "pullback long / Monthly 50": {
+      "closed_trades": 13,
+      "open_trades": 0,
+      "win_rate_pct": 23.1,
+      "avg_win_pct": 22.661,
+      "avg_loss_pct": -6.985,
+      "expectancy_pct": -0.144,
+      "median_return_pct": -6.273,
+      "avg_r": 0.492,
+      "median_candles_held": 0,
+      "longest_losing_streak": 6,
+      "exits": {
+        "target": 0,
+        "stop": 9,
+        "trail": 4,
+        "time": 0
+      }
+    },
+    "pullback long / Weekly 20": {
+      "closed_trades": 35,
+      "open_trades": 0,
+      "win_rate_pct": 34.3,
+      "avg_win_pct": 68.272,
+      "avg_loss_pct": -3.808,
+      "expectancy_pct": 20.905,
+      "median_return_pct": -2.611,
+      "avg_r": 2.003,
+      "median_candles_held": 2,
+      "longest_losing_streak": 12,
+      "exits": {
+        "target": 0,
+        "stop": 15,
+        "trail": 20,
+        "time": 0
+      }
+    },
+    "pullback long / Weekly 200": {
+      "closed_trades": 216,
+      "open_trades": 8,
+      "win_rate_pct": 22.7,
+      "avg_win_pct": 46.649,
+      "avg_loss_pct": -4.66,
+      "expectancy_pct": 6.979,
+      "median_return_pct": -3.538,
+      "avg_r": 0.874,
+      "median_candles_held": 3,
+      "longest_losing_streak": 35,
+      "exits": {
+        "target": 0,
+        "stop": 92,
+        "trail": 97,
+        "time": 27
+      }
+    },
+    "pullback long / Weekly 50": {
+      "closed_trades": 204,
+      "open_trades": 2,
+      "win_rate_pct": 20.1,
+      "avg_win_pct": 12.848,
+      "avg_loss_pct": -3.926,
+      "expectancy_pct": -0.555,
+      "median_return_pct": -2.868,
+      "avg_r": -0.064,
+      "median_candles_held": 2,
+      "longest_losing_streak": 42,
+      "exits": {
+        "target": 0,
+        "stop": 84,
+        "trail": 119,
+        "time": 1
+      }
+    },
+    "pullback short": {
+      "closed_trades": 301,
+      "open_trades": 0,
+      "win_rate_pct": 7.6,
+      "avg_win_pct": 9.704,
+      "avg_loss_pct": -4.876,
+      "expectancy_pct": -3.762,
+      "median_return_pct": -4.108,
+      "avg_r": -0.671,
+      "median_candles_held": 3,
+      "longest_losing_streak": 46,
+      "exits": {
+        "target": 0,
+        "stop": 84,
+        "trail": 214,
+        "time": 3
+      }
+    },
+    "pullback short / Biweekly 20": {
+      "closed_trades": 2,
+      "open_trades": 0,
+      "win_rate_pct": 0.0,
+      "avg_win_pct": null,
+      "avg_loss_pct": -5.741,
+      "expectancy_pct": -5.741,
+      "median_return_pct": -5.741,
+      "avg_r": -0.54,
+      "median_candles_held": 4,
+      "longest_losing_streak": 2,
+      "exits": {
+        "target": 0,
+        "stop": 0,
+        "trail": 2,
+        "time": 0
+      }
+    },
+    "pullback short / Biweekly 200": {
+      "closed_trades": 30,
+      "open_trades": 0,
+      "win_rate_pct": 3.3,
+      "avg_win_pct": 1.72,
+      "avg_loss_pct": -5.044,
+      "expectancy_pct": -4.818,
+      "median_return_pct": -4.638,
+      "avg_r": -0.886,
+      "median_candles_held": 3,
+      "longest_losing_streak": 21,
+      "exits": {
+        "target": 0,
+        "stop": 13,
+        "trail": 17,
+        "time": 0
+      }
+    },
+    "pullback short / Biweekly 50": {
+      "closed_trades": 6,
+      "open_trades": 0,
+      "win_rate_pct": 0.0,
+      "avg_win_pct": null,
+      "avg_loss_pct": -5.683,
+      "expectancy_pct": -5.683,
+      "median_return_pct": -5.621,
+      "avg_r": -0.742,
+      "median_candles_held": 2,
+      "longest_losing_streak": 6,
+      "exits": {
+        "target": 0,
+        "stop": 1,
+        "trail": 5,
+        "time": 0
+      }
+    },
+    "pullback short / Monthly 200": {
+      "closed_trades": 2,
+      "open_trades": 0,
+      "win_rate_pct": 0.0,
+      "avg_win_pct": null,
+      "avg_loss_pct": -9.642,
+      "expectancy_pct": -9.642,
+      "median_return_pct": -9.642,
+      "avg_r": -1.023,
+      "median_candles_held": 1,
+      "longest_losing_streak": 2,
+      "exits": {
+        "target": 0,
+        "stop": 2,
+        "trail": 0,
+        "time": 0
+      }
+    },
+    "pullback short / Monthly 50": {
+      "closed_trades": 1,
+      "open_trades": 0,
+      "win_rate_pct": 0.0,
+      "avg_win_pct": null,
+      "avg_loss_pct": -8.138,
+      "expectancy_pct": -8.138,
+      "median_return_pct": -8.138,
+      "avg_r": -1.025,
+      "median_candles_held": 1,
+      "longest_losing_streak": 1,
+      "exits": {
+        "target": 0,
+        "stop": 1,
+        "trail": 0,
+        "time": 0
+      }
+    },
+    "pullback short / Weekly 20": {
+      "closed_trades": 43,
+      "open_trades": 0,
+      "win_rate_pct": 4.7,
+      "avg_win_pct": 1.942,
+      "avg_loss_pct": -7.455,
+      "expectancy_pct": -7.018,
+      "median_return_pct": -6.49,
+      "avg_r": -0.864,
+      "median_candles_held": 2,
+      "longest_losing_streak": 35,
+      "exits": {
+        "target": 0,
+        "stop": 15,
+        "trail": 28,
+        "time": 0
+      }
+    },
+    "pullback short / Weekly 200": {
+      "closed_trades": 109,
+      "open_trades": 0,
+      "win_rate_pct": 6.4,
+      "avg_win_pct": 14.962,
+      "avg_loss_pct": -3.821,
+      "expectancy_pct": -2.615,
+      "median_return_pct": -3.789,
+      "avg_r": -0.659,
+      "median_candles_held": 4,
+      "longest_losing_streak": 44,
+      "exits": {
+        "target": 0,
+        "stop": 34,
+        "trail": 72,
+        "time": 3
+      }
+    },
+    "pullback short / Weekly 50": {
+      "closed_trades": 108,
+      "open_trades": 0,
+      "win_rate_pct": 12.0,
+      "avg_win_pct": 8.68,
+      "avg_loss_pct": -4.641,
+      "expectancy_pct": -3.038,
+      "median_return_pct": -4.155,
+      "avg_r": -0.534,
+      "median_candles_held": 3,
+      "longest_losing_streak": 26,
+      "exits": {
+        "target": 0,
+        "stop": 18,
+        "trail": 90,
+        "time": 0
+      }
+    }
+  },
+  "random_baseline": {
+    "pullback long": {
+      "signal_trades": 556,
+      "signal_avg_r": 0.599,
+      "signal_avg_return_pct": 5.039,
+      "signal_win_rate_pct": 22.7,
+      "random_trades": 1546,
+      "random_avg_r": 0.112,
+      "random_avg_return_pct": 1.218,
+      "random_win_rate_pct": 31.4
+    },
+    "pullback short": {
+      "signal_trades": 301,
+      "signal_avg_r": -0.671,
+      "signal_avg_return_pct": -3.762,
+      "signal_win_rate_pct": 7.6,
+      "random_trades": 903,
+      "random_avg_r": -0.592,
+      "random_avg_return_pct": -12.652,
+      "random_win_rate_pct": 9.3
+    }
+  }
+}
