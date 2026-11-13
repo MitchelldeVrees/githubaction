@@ -21,6 +21,14 @@ Trade rules (JDB component 1, break of the dominant average):
 - A trade still open after --max-candles candles exits at that candle's close.
   A trade still open at the end of the data is reported as open.
 
+Retracement shorts (JDB component 2) follow a break below dominant support,
+see simulate_retracement: short at the 50% retracement of the move from the
+recent top to the recent low, stop at about 69.4%, target the 200-period
+average.
+
+Before backtesting, each ticker's history is checked for implausible one-day
+price jumps (data errors); only the data after the last such jump is used.
+
 Pullback trades (JDB component 1, signal B) are simulated as well, see
 simulate_pullback: while an average is dominant, price coming back to it is an
 entry just on the trend side of the average with a stop just beyond it.
@@ -42,6 +50,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -314,6 +323,7 @@ def simulate_pullback(
     stop_atr: float,
     max_candles: int,
     cost_pct: float,
+    use_target: bool = True,
 ) -> Trade | None:
     """Simulate a pullback to the dominant average in the candle after `setup`.
 
@@ -328,8 +338,8 @@ def simulate_pullback(
     - Stop `stop_atr` ATR below the average. It follows the average from candle
       to candle and only ever tightens.
     - Target is the nearest other average (20, 50 or 200, same SMA/EMA type)
-      above the entry. With no average above, there is no target and the stop
-      alone ends the trade.
+      above the entry. With no average above, or with `use_target` off, there is
+      no target and the trailed stop alone ends the trade.
 
     The average of the last completed candle is used for the entry and stop of
     the candle being traded. Returns None when the candle never reaches the
@@ -376,7 +386,7 @@ def simulate_pullback(
 
     target_length = None
     target_series = None
-    for length in TARGET_LENGTHS:
+    for length in TARGET_LENGTHS if use_target else ():
         if length == setup.length or known + 1 < length:
             continue
         series = scanner.calculate_average(
@@ -458,6 +468,7 @@ def find_pullbacks(
     cost_pct: float = 0.1,
     max_attempts: int = 3,
     attempt_window: int = 26,
+    use_target: bool = True,
 ) -> list[Trade]:
     """Trade every pullback to the dominant level, one position per idea at a time.
 
@@ -480,7 +491,9 @@ def find_pullbacks(
                 continue
             count = 0
 
-        trade = simulate_pullback(setup, analyses, entry_atr, stop_atr, max_candles, cost_pct)
+        trade = simulate_pullback(
+            setup, analyses, entry_atr, stop_atr, max_candles, cost_pct, use_target
+        )
         if trade is None:
             continue
         trades.append(trade)
@@ -613,6 +626,402 @@ def simulate_trade(
     )
 
 
+def clean_history(
+    daily: pd.DataFrame,
+    max_jump: float,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Drop the history before the last implausible one-day price jump.
+
+    A close more than `max_jump` times the previous close, or less than
+    1 / `max_jump` of it, is treated as a data error, such as a share split
+    applied to only part of the history. Everything up to and including that
+    day is dropped. Returns the remaining data and the jumps found.
+    """
+    close = daily["Close"]
+    ratio = close / close.shift(1)
+    bad = ratio[(ratio > max_jump) | (ratio < 1 / max_jump)]
+    flags = [
+        {
+            "date": pd.Timestamp(date).date().isoformat(),
+            "previous_close": round(float(close.shift(1).loc[date]), 6),
+            "close": round(float(close.loc[date]), 6),
+            "ratio": round(float(value), 3),
+        }
+        for date, value in bad.items()
+    ]
+    if bad.empty:
+        return daily, flags
+    return daily.loc[daily.index > bad.index[-1]], flags
+
+
+def simulate_retracement(
+    signal: Signal,
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    max_wait: int,
+    max_attempts: int,
+    max_candles: int,
+    cost_pct: float,
+) -> list[Trade]:
+    """Simulate JDB's retracement short after a break below dominant support.
+
+    The retracement is drawn on the signal's own timeframe:
+
+    - 100% is the highest high of the dominant streak that just broke.
+    - 0% is the lowest low since that top. It is redrawn whenever price makes a
+      new low, using only completed candles.
+    - Entry: short when a candle trades up to exactly 50%, coming from below:
+      the previous candle closed under 50%. A candle that opens above 50% (but
+      below the stop) is entered at its open, as a resting order would be.
+    - Stop: one fifth of the way from 61.8% to 100%, about 69.4%, fixed at entry.
+    - Target: the first 200-period average reached, SMA or EMA, whichever is
+      higher. An attempt is only made while that target is below the entry.
+
+    The setup is watched for `max_wait` candles after the break. It ends early
+    when price closes above the top, or when price reaches the 200-period
+    average before an entry. A stopped-out attempt may be followed by another
+    one, up to `max_attempts` in total, but only after price has made a new
+    low, so the next attempt is drawn from a lower 0% level.
+    """
+    if signal.signal_type != "break_below_dominant_support":
+        return []
+    analysis = analyses[(signal.timeframe, signal.length, signal.average_type)]
+    ohlc = analysis.ohlc
+    dates = ohlc.index
+    open_, high, low, close = (
+        ohlc[column].to_numpy(dtype=float) for column in ("Open", "High", "Low", "Close")
+    )
+    if len(close) < 200:
+        return []
+    sma200 = scanner.calculate_average(ohlc["Close"], 200, "SMA").to_numpy(dtype=float)
+    ema200 = scanner.calculate_average(ohlc["Close"], 200, "EMA").to_numpy(dtype=float, copy=True)
+    ema200[:199] = np.nan  # an EMA needs a full window before it means anything
+    target_line = np.fmax(sma200, ema200)
+
+    broke = signal.position
+    first = max(0, broke - signal.bars_streak)
+    top = float(np.max(high[first : broke + 1]))
+    divergence = scanner.divergence_context(ohlc, broke)
+
+    trades: list[Trade] = []
+    swing_low = float(np.min(low[int(np.argmax(high[first : broke + 1])) + first : broke + 1]))
+    needs_new_low_below: float | None = None  # set after a stopped-out attempt
+    k = broke + 1
+    last_watch = min(len(close) - 1, broke + max_wait)
+    while k <= last_watch and len(trades) < max_attempts:
+        # Levels for candle k, from candles up to k - 1 only.
+        span = top - swing_low
+        target = target_line[k - 1]
+        if span <= 0 or not np.isfinite(target):
+            swing_low = min(swing_low, low[k])
+            k += 1
+            continue
+        entry_level = swing_low + 0.5 * span
+        stop_level = swing_low + (0.618 + 0.2 * (1 - 0.618)) * span
+        if target >= entry_level:
+            # No room between the 50% level and the 200-period average.
+            if low[k] <= target and not trades:
+                break  # price reached the target first: the move is over
+            swing_low = min(swing_low, low[k])
+            k += 1
+            continue
+
+        ready = needs_new_low_below is None or swing_low < needs_new_low_below
+        if ready and close[k - 1] < entry_level and high[k] >= entry_level and open_[k] < stop_level:
+            entry = max(open_[k], entry_level)
+            risk = stop_level - entry
+            entry_at = k
+            exit_at, exit_price, reason = len(close) - 1, close[-1], "open"
+            if high[k] >= stop_level:
+                # Rallied through 50% and on to the stop inside the entry candle.
+                exit_at, exit_price, reason = k, stop_level, "stop"
+            else:
+                for j in range(k + 1, len(close)):
+                    level = target_line[j - 1]
+                    if high[j] >= stop_level:
+                        gapped = open_[j] >= stop_level
+                        exit_at, exit_price = j, (open_[j] if gapped else stop_level)
+                        reason = "stop"
+                        break
+                    if np.isfinite(level) and low[j] <= level:
+                        gapped = open_[j] <= level
+                        exit_at, exit_price = j, (open_[j] if gapped else level)
+                        reason = "target"
+                        break
+                    if j - entry_at >= max_candles:
+                        exit_at, exit_price, reason = j, close[j], "time"
+                        break
+
+            return_pct = -(exit_price / entry - 1) * 100 - 2 * cost_pct
+            r_multiple = (entry - exit_price) / risk - 2 * cost_pct / 100 * entry / risk
+            trades.append(
+                Trade(
+                    setup="retracement",
+                    ticker=signal.ticker,
+                    side="short",
+                    timeframe=signal.timeframe,
+                    length=signal.length,
+                    average_type=signal.average_type,
+                    bars_streak=signal.bars_streak,
+                    streak_touches=signal.streak_touches,
+                    faulty_candles=signal.faulty_candles,
+                    score=round(signal.score, 2),
+                    rsi_at_entry=divergence["rsi"],
+                    negative_divergence=divergence["negative_divergence"],
+                    positive_divergence=divergence["positive_divergence"],
+                    entry_date=pd.Timestamp(dates[entry_at]).date().isoformat(),
+                    entry_price=round(float(entry), 4),
+                    target=f"{signal.timeframe} 200 (first of SMA/EMA)",
+                    target_at_entry=round(float(target), 4),
+                    stop_at_entry=round(float(stop_level), 4),
+                    exit_date=pd.Timestamp(dates[exit_at]).date().isoformat(),
+                    exit_price=round(float(exit_price), 4),
+                    exit_reason=reason,
+                    candles_held=exit_at - entry_at,
+                    return_pct=round(float(return_pct), 3),
+                    r_multiple=round(float(r_multiple), 3),
+                )
+            )
+            if reason != "stop":
+                break  # target, time or still open: the idea has played out
+            needs_new_low_below = swing_low
+            k = exit_at + 1
+            last_watch = min(len(close) - 1, max(last_watch, k + max_wait // 2))
+            continue
+
+        if close[k] > top:
+            break  # a new high: the bearish idea is invalid
+        swing_low = min(swing_low, low[k])
+        k += 1
+    return trades
+
+
+def random_baseline(
+    trades: list[Trade],
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    per_trade: int,
+    max_candles: int,
+    cost_pct: float,
+) -> list[dict[str, Any]]:
+    """Trade the same geometry as each signal at random dates, as a control.
+
+    For every closed break and retracement trade, `per_trade` trades are made in
+    the same ticker, timeframe and direction, entered at the close of a random
+    candle, with the stop and target at the same percentage distance from the
+    entry as the real trade had. Stop and target stay fixed. If the signal adds
+    nothing, the real trades and these random ones should score about the same,
+    whatever the stock universe's own drift is.
+    """
+    rows: list[dict[str, Any]] = []
+    for trade in trades:
+        if trade.setup not in ("break", "retracement") or trade.exit_reason == "open":
+            continue
+        if trade.stop_at_entry is None or trade.target_at_entry is None:
+            continue
+        ohlc = analyses[(trade.timeframe, trade.length, trade.average_type)].ohlc
+        open_, high, low, close = (
+            ohlc[column].to_numpy(dtype=float) for column in ("Open", "High", "Low", "Close")
+        )
+        if len(close) < 260:
+            continue
+        short = trade.side == "short"
+        sign = -1.0 if short else 1.0
+        stop_ratio = trade.stop_at_entry / trade.entry_price
+        target_ratio = trade.target_at_entry / trade.entry_price
+        seed = zlib.crc32(f"{trade.ticker}|{trade.setup}|{trade.entry_date}".encode())
+        rng = np.random.default_rng(seed)
+        for position in rng.integers(200, len(close) - 1, size=per_trade):
+            entry = close[position]
+            stop, target = entry * stop_ratio, entry * target_ratio
+            risk = abs(entry - stop)
+            if risk <= 0:
+                continue
+            exit_price, reason = None, None
+            for k in range(position + 1, len(close)):
+                if high[k] >= stop if short else low[k] <= stop:
+                    gapped = open_[k] >= stop if short else open_[k] <= stop
+                    exit_price, reason = (open_[k] if gapped else stop), "stop"
+                    break
+                if low[k] <= target if short else high[k] >= target:
+                    gapped = open_[k] <= target if short else open_[k] >= target
+                    exit_price, reason = (open_[k] if gapped else target), "target"
+                    break
+                if k - position >= max_candles:
+                    exit_price, reason = close[k], "time"
+                    break
+            if exit_price is None:
+                continue  # still open at the end of the data
+            rows.append(
+                {
+                    "setup": trade.setup,
+                    "side": trade.side,
+                    "timeframe": trade.timeframe,
+                    "length": trade.length,
+                    "average_type": trade.average_type,
+                    "ticker": trade.ticker,
+                    "entry_date": pd.Timestamp(ohlc.index[position]).date().isoformat(),
+                    "exit_reason": reason,
+                    "return_pct": round(
+                        float(sign * (exit_price / entry - 1) * 100 - 2 * cost_pct), 3
+                    ),
+                    "r_multiple": round(
+                        float(sign * (exit_price - entry) / risk - 2 * cost_pct / 100 * entry / risk),
+                        3,
+                    ),
+                }
+            )
+    return rows
+
+
+def pullback_controls(
+    trades: list[Trade],
+    analyses: dict[tuple[str, int, str], scanner.CandidateAnalysis],
+    per_trade: int,
+    stop_atr: float,
+    max_candles: int,
+    cost_pct: float,
+    use_target: bool,
+) -> list[dict[str, Any]]:
+    """Control trades for pullbacks: same trend, random timing.
+
+    For every closed pullback trade, `per_trade` trades are entered at the close
+    of a random candle in which the same average was dominant in the same
+    direction, so the trend condition is identical but the entry does not wait
+    for a pullback. Stop, trailing and target follow the pullback rules. If
+    waiting for the pullback adds nothing, these trades should score about the
+    same as the real ones.
+    """
+    rows: list[dict[str, Any]] = []
+    for trade in trades:
+        if trade.setup != "pullback" or trade.exit_reason == "open":
+            continue
+        analysis = analyses[(trade.timeframe, trade.length, trade.average_type)]
+        ohlc = analysis.ohlc
+        open_, high, low, close = (
+            ohlc[column].to_numpy(dtype=float) for column in ("Open", "High", "Low", "Close")
+        )
+        dominant = analysis.ma.to_numpy(dtype=float)
+        atr = calculate_atr(ohlc)
+        long = trade.side == "long"
+        sign = 1.0 if long else -1.0
+        wanted = SUPPORT if long else RESISTANCE
+        candidates = np.flatnonzero(
+            (analysis.direction.to_numpy() == wanted) & np.isfinite(atr) & np.isfinite(dominant)
+        )
+        candidates = candidates[candidates < len(close) - 1]
+        if len(candidates) == 0:
+            continue
+        seed = zlib.crc32(f"{trade.ticker}|pullback|{trade.entry_date}".encode())
+        rng = np.random.default_rng(seed)
+        for position in rng.choice(candidates, size=per_trade):
+            entry = close[position]
+            stop = initial_stop = dominant[position] - sign * stop_atr * atr[position]
+            if sign * (entry - stop) <= 0:
+                continue
+            risk = abs(entry - stop)
+            target_series = None
+            for length in TARGET_LENGTHS if use_target else ():
+                if length == trade.length or position + 1 < length:
+                    continue
+                series = scanner.calculate_average(
+                    ohlc["Close"], length, trade.average_type
+                ).to_numpy(dtype=float)
+                value = series[position]
+                if not np.isfinite(value) or sign * (value - entry) <= 0:
+                    continue
+                if target_series is None or abs(value - entry) < abs(
+                    target_series[position] - entry
+                ):
+                    target_series = series
+            exit_price, reason = None, None
+            for k in range(position + 1, len(close)):
+                if np.isfinite(dominant[k - 1]) and np.isfinite(atr[k - 1]):
+                    level = dominant[k - 1] - sign * stop_atr * atr[k - 1]
+                    stop = max(stop, level) if long else min(stop, level)
+                if low[k] <= stop if long else high[k] >= stop:
+                    gapped = sign * (open_[k] - stop) <= 0
+                    exit_price = open_[k] if gapped else stop
+                    reason = "stop" if stop == initial_stop else "trail"
+                    break
+                if target_series is not None and (
+                    high[k] >= target_series[k - 1] if long else low[k] <= target_series[k - 1]
+                ):
+                    target = target_series[k - 1]
+                    gapped = sign * (open_[k] - target) >= 0
+                    exit_price, reason = (open_[k] if gapped else target), "target"
+                    break
+                if k - position >= max_candles:
+                    exit_price, reason = close[k], "time"
+                    break
+            if exit_price is None:
+                continue
+            rows.append(
+                {
+                    "setup": "pullback",
+                    "side": trade.side,
+                    "timeframe": trade.timeframe,
+                    "length": trade.length,
+                    "average_type": trade.average_type,
+                    "ticker": trade.ticker,
+                    "entry_date": pd.Timestamp(ohlc.index[position]).date().isoformat(),
+                    "exit_reason": reason,
+                    "return_pct": round(
+                        float(sign * (exit_price / entry - 1) * 100 - 2 * cost_pct), 3
+                    ),
+                    "r_multiple": round(
+                        float(sign * (exit_price - entry) / risk - 2 * cost_pct / 100 * entry / risk),
+                        3,
+                    ),
+                }
+            )
+    return rows
+
+
+def baseline_summary(
+    trades: list[Trade],
+    baseline: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Compare real trades with their random-date controls, per setup and side."""
+    result: dict[str, dict[str, Any]] = {}
+    for setup in ("break", "pullback", "retracement"):
+        for side in ("long", "short"):
+            real = [
+                trade.r_multiple
+                for trade in trades
+                if trade.setup == setup
+                and trade.side == side
+                and trade.exit_reason != "open"
+                and trade.r_multiple is not None
+            ]
+            control = [
+                row["r_multiple"]
+                for row in baseline
+                if row["setup"] == setup and row["side"] == side
+            ]
+            if not real or not control:
+                continue
+            real_pct = [
+                trade.return_pct
+                for trade in trades
+                if trade.setup == setup and trade.side == side and trade.exit_reason != "open"
+            ]
+            control_pct = [
+                row["return_pct"]
+                for row in baseline
+                if row["setup"] == setup and row["side"] == side
+            ]
+            result[f"{setup} {side}"] = {
+                "signal_trades": len(real),
+                "signal_avg_r": round(float(np.mean(real)), 3),
+                "signal_avg_return_pct": round(float(np.mean(real_pct)), 3),
+                "signal_win_rate_pct": round(float(np.mean(np.array(real) > 0) * 100), 1),
+                "random_trades": len(control),
+                "random_avg_r": round(float(np.mean(control)), 3),
+                "random_avg_return_pct": round(float(np.mean(control_pct)), 3),
+                "random_win_rate_pct": round(float(np.mean(np.array(control) > 0) * 100), 1),
+            }
+    return result
+
+
 def backtest_ticker(
     ticker: str,
     daily: pd.DataFrame,
@@ -625,11 +1034,30 @@ def backtest_ticker(
     setups: tuple[str, ...] = ("break",),
     pullback_entry_atr: float = 0.25,
     pullback_stop_atr: float = 0.75,
+    retrace_max_wait: int = 52,
+    retrace_attempts: int = 3,
+    pullback_target: str = "next",
 ) -> tuple[list[Trade], int]:
     """Backtest one ticker. Returns its trades and the number of untradable breaks."""
     analyses = scanner.build_candidate_analyses(daily)
     trades: list[Trade] = []
     skipped = 0
+    if "retracement" in setups:
+        busy_until: dict[str, pd.Timestamp] = {}
+        for signal in find_signals(ticker, analyses):
+            if start is not None and signal.run_date < start:
+                continue
+            break_date = analyses[
+                (signal.timeframe, signal.length, signal.average_type)
+            ].ohlc.index[signal.position]
+            if break_date <= busy_until.get(signal.timeframe, pd.Timestamp.min):
+                continue  # one retracement idea per timeframe at a time
+            idea = simulate_retracement(
+                signal, analyses, retrace_max_wait, retrace_attempts, max_candles, cost_pct
+            )
+            if idea:
+                trades.extend(idea)
+                busy_until[signal.timeframe] = pd.Timestamp(idea[-1].exit_date)
     if "pullback" in setups:
         trades.extend(
             trade
@@ -640,6 +1068,7 @@ def backtest_ticker(
                 stop_atr=pullback_stop_atr,
                 max_candles=max_candles,
                 cost_pct=cost_pct,
+                use_target=pullback_target == "next",
             )
             if start is None or pd.Timestamp(trade.entry_date) >= start
         )
@@ -779,9 +1208,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--setups",
-        default="break,pullback",
+        default="break,pullback,retracement",
         help="comma-separated: break (close through the dominant average), "
-        "pullback (return to the dominant average)",
+        "pullback (return to the dominant average), "
+        "retracement (short at 50%% after a break below dominant support)",
+    )
+    parser.add_argument(
+        "--pullback-target",
+        choices=("next", "none"),
+        default="next",
+        help="next: exit a pullback at the nearest other average; "
+        "none: no target, ride the trend with the trailed stop",
+    )
+    parser.add_argument(
+        "--retrace-max-wait",
+        type=int,
+        default=52,
+        help="candles after a break during which the 50%% retracement is watched",
+    )
+    parser.add_argument(
+        "--retrace-attempts",
+        type=int,
+        default=3,
+        help="maximum retracement shorts per break",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=int,
+        default=0,
+        help="random-date control trades per trade (0: off)",
+    )
+    parser.add_argument(
+        "--max-daily-jump",
+        type=float,
+        default=4.0,
+        help="a one-day price change beyond this factor is treated as a data error",
     )
     parser.add_argument(
         "--pullback-entry-atr",
@@ -806,7 +1267,7 @@ def main() -> None:
     args = parse_args()
     start = pd.Timestamp(args.start) if args.start else None
     setups = tuple(name.strip() for name in args.setups.split(",") if name.strip())
-    unknown = set(setups) - {"break", "pullback"}
+    unknown = set(setups) - {"break", "pullback", "retracement"}
     if unknown:
         raise SystemExit(f"Unknown setup: {', '.join(sorted(unknown))}")
     tickers = scanner.load_tickers(args.tickers_file)
@@ -814,9 +1275,16 @@ def main() -> None:
 
     trades: list[Trade] = []
     skipped = 0
+    data_flags: list[dict[str, Any]] = []
+    baseline: list[dict[str, Any]] = []
     for ticker in tickers:
         daily = price_data.get(ticker)
         if daily is None:
+            continue
+        daily, flags = clean_history(daily, args.max_daily_jump)
+        data_flags.extend({"ticker": ticker, **flag} for flag in flags)
+        if len(daily) < 260:
+            errors[ticker] = "too little clean price history"
             continue
         try:
             ticker_trades, ticker_skipped = backtest_ticker(
@@ -831,18 +1299,43 @@ def main() -> None:
                 setups=setups,
                 pullback_entry_atr=args.pullback_entry_atr,
                 pullback_stop_atr=args.pullback_stop_atr,
+                retrace_max_wait=args.retrace_max_wait,
+                retrace_attempts=args.retrace_attempts,
+                pullback_target=args.pullback_target,
             )
         except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the run.
             errors[ticker] = str(exc)
             continue
         trades.extend(ticker_trades)
         skipped += ticker_skipped
+        if args.baseline > 0:
+            analyses = scanner.build_candidate_analyses(daily)
+            baseline.extend(
+                random_baseline(
+                    ticker_trades, analyses, args.baseline, args.max_candles, args.cost_pct
+                )
+            )
+            baseline.extend(
+                pullback_controls(
+                    ticker_trades,
+                    analyses,
+                    args.baseline,
+                    args.pullback_stop_atr,
+                    args.max_candles,
+                    args.cost_pct,
+                    use_target=args.pullback_target == "next",
+                )
+            )
 
     summary = {
         "settings": {
             "setups": list(setups),
             "pullback_entry_atr": args.pullback_entry_atr,
             "pullback_stop_atr": args.pullback_stop_atr,
+            "pullback_target": args.pullback_target,
+            "retrace_max_wait": args.retrace_max_wait,
+            "retrace_attempts": args.retrace_attempts,
+            "max_daily_jump": args.max_daily_jump,
             "stop": args.stop,
             "stop_buffer_pct": args.stop_buffer_pct,
             "trail_after_r": args.trail_after_r if args.stop == "trail" else None,
@@ -857,10 +1350,35 @@ def main() -> None:
         },
         "tickers": len(tickers),
         "tickers_with_errors": len(errors),
+        "tickers_cut_for_data_errors": sorted({flag["ticker"] for flag in data_flags}),
         "breaks_without_target": skipped,
         "groups": grouped_summary(trades),
     }
+    if args.baseline > 0:
+        summary["random_baseline"] = baseline_summary(trades, baseline)
     write_outputs(trades, summary, args.out)
+    with (args.out / "data_flags.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["ticker", "date", "previous_close", "close", "ratio"]
+        )
+        writer.writeheader()
+        writer.writerows(data_flags)
+    if baseline:
+        with (args.out / "baseline_trades.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(baseline[0]))
+            writer.writeheader()
+            writer.writerows(baseline)
+        print("\nSignal against its random-date controls (see --baseline):")
+        for name, row in summary["random_baseline"].items():
+            print(
+                f"{name:<20} signal {row['signal_avg_r']:+.3f} R "
+                f"{row['signal_avg_return_pct']:+.2f}% ({row['signal_trades']}), "
+                f"random {row['random_avg_r']:+.3f} R "
+                f"{row['random_avg_return_pct']:+.2f}% ({row['random_trades']})"
+            )
+    if errors:
+        with (args.out / "errors.json").open("w", encoding="utf-8") as handle:
+            json.dump(errors, handle, indent=2)
     print_summary(summary)
     print(
         f"\n{len(trades)} trades from {len(tickers) - len(errors)} tickers; "

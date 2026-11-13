@@ -160,7 +160,8 @@ candles (default 104) exits at the close. Costs default to 0.1% per side.
 to just beyond the dominant average and follows it, only ever tightening. Exits
 on the moved stop are counted as `trail` in the summary.
 
-Two entries are simulated, chosen with `--setups` (default `break,pullback`):
+Three entries are simulated, chosen with `--setups` (default
+`break,pullback,retracement`):
 
 - `break`: the close through the dominant average described above.
 - `pullback`: while an average is dominant, price coming back to it. For
@@ -170,11 +171,23 @@ Two entries are simulated, chosen with `--setups` (default `break,pullback`):
   a monthly stop sits further from the average than a weekly one and a volatile
   stock gets more room than a quiet one. The stop follows the average and only
   tightens. The target is the nearest other average above the entry; when price
-  is above all of them there is no target and the trailed stop ends the trade.
+  is above all of them, or with `--pullback-target none`, there is no target
+  and the trailed stop ends the trade.
   Dominant resistance is the mirror image, a short. One position per idea at a
   time, where the SMA and EMA of the same timeframe and length are one idea;
   after three losing attempts in a row on an idea, no new attempt for 26
   candles.
+
+- `retracement` (JDB component 2): after a break below dominant support, a
+  short at the 50% retracement of the move from the top of the broken streak
+  (100%) to the lowest low since (0%, redrawn on every new low). The short is
+  only entered when price comes up to 50% from below. Stop at one fifth of the
+  way from 61.8% to 100% (about 69.4%), target the first 200-period average
+  reached on the same timeframe (SMA or EMA, whichever is higher). The setup is
+  watched for `--retrace-max-wait` candles (default 52) and ends when price
+  closes above the top or reaches the 200-period average before an entry. After
+  a stop, a new attempt needs a new low first; at most `--retrace-attempts`
+  (default 3) per break. Blow-off tops without an MA break are not detected.
 
 The entry and stop of a pullback use the average of the last completed candle,
 and the trade is entered inside the next candle, which is how a touch of the
@@ -183,6 +196,21 @@ as a full loss.
 
 The summary reports the two entries separately (`break short`, `pullback long`,
 and so on).
+
+Before a ticker is tested, its history is checked for data errors: a one-day
+close more than `--max-daily-jump` (default 4) times the previous close, or less
+than a quarter of it. Only the data after the last such jump is used, and every
+jump is listed in `data_flags.csv`.
+
+`--baseline N` adds a control: for every closed break and retracement trade, N
+trades in the same ticker, timeframe and direction at random dates, with the
+stop and target at the same percentage distance. For every pullback trade, N
+trades entered at random candles in which the same average was dominant in the
+same direction, with the pullback's stop, trailing and target rules; this asks
+whether waiting for the pullback beats entering anywhere in the same trend. They are written to
+`baseline_trades.csv` and compared with the real trades in the summary. Because
+the control trades come from the same stocks, it separates the signal's effect
+from the drift of the stock universe, including the survivor effect.
 
 Each trade records RSI and divergence on the break candle. Divergence filters
 nothing; the summary has `short with divergence`, `short without divergence`,
@@ -193,13 +221,21 @@ Output goes to `results/backtest/`: `backtest_trades.csv` with every trade and
 `backtest_summary.json` with win rate, average win and loss, expectancy, average
 R, holding time and the longest losing streak, overall and per dominant level.
 
+`tickers_indices.txt` holds indices, sector and bond ETFs, commodities and
+crypto. JDB applies the strategy to all of these, and an index does not carry
+the survivor effect of a list of today's largest companies:
+
+```bash
+python backtest.py --tickers-file tickers_indices.txt --out results/backtest_indices
+```
+
 Read the results with these limits in mind:
 
 - `tickers.txt` holds companies that exist today. Companies that failed are
   missing, which flatters long trades and penalizes short trades.
 - Monthly and quarterly levels produce few trades per ticker.
 - Entries assume a fill at the closing price of the break candle.
-- Retracement entries, Bollinger entries and options are not tested.
+- Blow-off tops, Bollinger entries and options are not tested.
 - "A little above" and "a little below" the average are not quantified by JDB;
   the 0.25 and 0.75 ATR defaults are this project's choice.
 
