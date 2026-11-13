@@ -900,6 +900,8 @@ def random_baseline(
     per_trade: int,
     max_candles: int,
     cost_pct: float,
+    stop_trigger: str = "intrabar",
+    start: pd.Timestamp | None = None,
 ) -> list[dict[str, Any]]:
     """Trade the same geometry as each signal at random dates, as a control.
 
@@ -908,7 +910,9 @@ def random_baseline(
     candle, with the stop and target at the same percentage distance from the
     entry as the real trade had. Stop and target stay fixed. If the signal adds
     nothing, the real trades and these random ones should score about the same,
-    whatever the stock universe's own drift is.
+    whatever the stock universe's own drift is. The stop of a break control
+    follows `stop_trigger`, as the real break trades do, and random dates are
+    drawn from `start` on, the same period as the signals.
     """
     rows: list[dict[str, Any]] = []
     for trade in trades:
@@ -928,7 +932,13 @@ def random_baseline(
         target_ratio = trade.target_at_entry / trade.entry_price
         seed = zlib.crc32(f"{trade.ticker}|{trade.setup}|{trade.entry_date}".encode())
         rng = np.random.default_rng(seed)
-        for position in rng.integers(200, len(close) - 1, size=per_trade):
+        first = 200
+        if start is not None:
+            first = max(first, int(np.searchsorted(ohlc.index.to_numpy(), start.to_datetime64())))
+        if first >= len(close) - 1:
+            continue
+        on_close = stop_trigger == "close" and trade.setup == "break"
+        for position in rng.integers(first, len(close) - 1, size=per_trade):
             entry = close[position]
             stop, target = entry * stop_ratio, entry * target_ratio
             risk = abs(entry - stop)
@@ -936,13 +946,16 @@ def random_baseline(
                 continue
             exit_price, reason = None, None
             for k in range(position + 1, len(close)):
-                if high[k] >= stop if short else low[k] <= stop:
+                if not on_close and (high[k] >= stop if short else low[k] <= stop):
                     gapped = open_[k] >= stop if short else open_[k] <= stop
                     exit_price, reason = (open_[k] if gapped else stop), "stop"
                     break
                 if low[k] <= target if short else high[k] >= target:
                     gapped = open_[k] <= target if short else open_[k] >= target
                     exit_price, reason = (open_[k] if gapped else target), "target"
+                    break
+                if on_close and (close[k] >= stop if short else close[k] <= stop):
+                    exit_price, reason = close[k], "stop"
                     break
                 if k - position >= max_candles:
                     exit_price, reason = close[k], "time"
@@ -1466,7 +1479,13 @@ def main() -> None:
             analyses = scanner.build_candidate_analyses(daily)
             baseline.extend(
                 random_baseline(
-                    ticker_trades, analyses, args.baseline, args.max_candles, args.cost_pct
+                    ticker_trades,
+                    analyses,
+                    args.baseline,
+                    args.max_candles,
+                    args.cost_pct,
+                    stop_trigger=args.stop_trigger,
+                    start=start,
                 )
             )
             baseline.extend(

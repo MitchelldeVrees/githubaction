@@ -62,6 +62,10 @@ jobs:
             cache: raw
             settings: "DIVERGENCE_SOURCE=close DIVERGENCE_MIN_GAP=8 DIVERGENCE_MIN_PRICE_PCT=1 DIVERGENCE_MIN_RSI_DIFF=3 DIVERGENCE_MAX_AGE=13 TOUCH_CLUSTERS=true TOUCH_IGNORE_LAST=5 CLEAN_FINAL_BARS=20"
             args: "--stop-trigger close --entry-max-atr 1.5 --skip-target-hit --pullback-lengths 20,50 --pullback-skip-divergence"
+          - name: raw_baseline
+            auto_adjust: "false"
+            cache: raw
+            args: "--setups break,retracement --baseline 5"
           - name: raw_reviewed_baseline
             auto_adjust: "false"
             cache: raw
